@@ -10,4 +10,6 @@ COPY --from=build /build/target/release/shopping-sessions /usr/local/bin/shoppin
 USER 1000:1000
 WORKDIR /scratch
 ENV DATA_DIR=/data OUTPUT_DIR=/output SCRATCH_DIR=/scratch HOME=/scratch NCPU=8
+# madvise(MADV_HUGEPAGE) malloc's heaps and grow them 256 MB at a time: ~10x fewer page faults and TLB misses.
+ENV GLIBC_TUNABLES=glibc.malloc.hugetlb=1:glibc.malloc.top_pad=268435456
 ENTRYPOINT ["/usr/local/bin/shopping-sessions"]
