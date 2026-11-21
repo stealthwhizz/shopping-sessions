@@ -16,6 +16,7 @@ const CODES: [u8;256] = {
 
 pub fn pack(bytes: &[u8]) -> Option<u64> {
     if bytes.len() > 10 { return None; }
+    if bytes.len() >= 8 { return pack_long(bytes); }
     let mut key = 0u64;
     let mut invalid = false;
     for &byte in bytes {
@@ -24,6 +25,33 @@ pub fn pack(bytes: &[u8]) -> Option<u64> {
         key = (key << 6) | u64::from(code);
     }
     (!invalid).then_some(key << ((64-6*bytes.len()) & 63))
+}
+
+/// `pack` for 8 to 10 bytes: the first 8 are classified and coded eight at a time (SWAR).
+#[inline(always)]
+fn pack_long(bytes: &[u8]) -> Option<u64> {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    let x = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+    // With every high bit clear, x + (0x80-c) sets a byte's high bit iff that byte >= c, carry-free.
+    let ge = |c: u8| x.wrapping_add(ONES * u64::from(0x80 - c)) & HIGH;
+    let (ge_0, gt_9, ge_a_upper, gt_z_upper, ge_a, gt_z) = (ge(b'0'), ge(b'9'+1), ge(b'A'), ge(b'Z'+1), ge(b'a'), ge(b'z'+1));
+    let valid = (ge_0 & !gt_9) | (ge_a_upper & !gt_z_upper) | (ge_a & !gt_z);
+    if x & HIGH != 0 || valid != HIGH { return None; }
+    // Codes: digit c-0x2f, upper c-0x36 (7 less), lower c-0x3c (6 less again); no byte borrows.
+    let codes = x - (ONES * 0x2f + (ge_a_upper >> 7) * 7 + (ge_a >> 7) * 6);
+    // Byte 0 becomes most significant, then 6-bit codes are packed pairwise into 48 bits.
+    let v = codes.swap_bytes();
+    let v = ((v & 0x3f00_3f00_3f00_3f00) >> 2) | (v & 0x003f_003f_003f_003f);
+    let v = ((v & 0x0fff_0000_0fff_0000) >> 4) | (v & 0x0000_0fff_0000_0fff);
+    let v = ((v & 0x00ff_ffff_0000_0000) >> 8) | (v & 0x0000_0000_00ff_ffff);
+    let mut key = v << 16;
+    for (i, &byte) in bytes[8..].iter().enumerate() {
+        let code = CODES[byte as usize];
+        if code == 0 { return None; }
+        key |= u64::from(code) << (10 - 6 * i);
+    }
+    Some(key)
 }
 
 pub fn unpack(mut key: u64, bytes: &mut [u8;10]) -> usize {
@@ -106,6 +134,24 @@ mod tests {
     #[test]
     fn non_alphanumeric_and_overlong_ids_require_exact_fallback() {
         for text in ["a_b", " u", "u ", "é", "a,b", "abcdefghijk", "a\0"] { assert_eq!(pack(text.as_bytes()), None); }
+    }
+    #[test]
+    fn swar_pack_matches_scalar_on_every_byte_at_every_position() {
+        let scalar = |bytes: &[u8]| -> Option<u64> {
+            let mut key = 0u64;
+            for &byte in bytes { let code = CODES[byte as usize]; if code == 0 { return None; } key = (key << 6) | u64::from(code); }
+            Some(key << (64-6*bytes.len()))
+        };
+        for length in 8..=10 {
+            for position in 0..length {
+                for byte in 0..=255u8 {
+                    let mut text = b"aZ09zA9b0q".to_vec();
+                    text.truncate(length);
+                    text[position] = byte;
+                    assert_eq!(pack(&text), scalar(&text), "{text:?}");
+                }
+            }
+        }
     }
     #[test]
     fn aligned_packed_keys_mix_into_low_table_index_bits() {
