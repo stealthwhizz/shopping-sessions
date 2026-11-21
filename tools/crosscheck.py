@@ -23,7 +23,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SEEDS_DIR = ROOT / "data" / "seeds"
-OUT_DIR = ROOT / "data" / "crosscheck-out"
+# Per-process so concurrent runs never delete each other's outputs.
+OUT_DIR = ROOT / "data" / "crosscheck-out" / f"run-{os.getpid()}"
 REFERENCE = [sys.executable, str(ROOT / "reference" / "pipeline" / "pipeline.py")]
 LEAP_DAY = "2028-02-29T00:00:00Z"
 # 15, 62, 249 hold 2028-02-29 (from `find-leap`); 10-18 are ordinary; 3 is the 20M run.
