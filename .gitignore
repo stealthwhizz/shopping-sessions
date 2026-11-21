@@ -1,3 +1,9 @@
 progress.md
 .env*
 !.env.example
+data/
+out/
+out-*/
+target/
+.venv/
+__pycache__/
