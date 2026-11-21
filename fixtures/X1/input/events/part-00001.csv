@@ -1,0 +1,2 @@
+event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents
+x1,ux,2028-02-25T10:00:00Z,2028-02-25T10:05:00Z,view,p1,

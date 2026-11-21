@@ -58,3 +58,11 @@ One session per user at Oct 3 10:00, unless noted.
 | L2 | `u3,u9` and `u9,u2` in one file, `U7,u9` and `u10,u10` in another; events by `u3`, `u2` and `u10` only | Links chain, in either direction and across files; the person is named by the smallest ID even when no event uses it; a self-link changes nothing |
 | L3 | `u1,u2,u3`, `u1,`, `,u3`, `u1,u5"`, an empty line and `u1` (all dropped); `"u4","u1"`, `u4,u1` and `u6,u6` (kept); one event each by `u1` to `u6` | Malformed links and links with an empty side are dropped; quoted, repeated and self-links are fine. A data row equal to the header joins `user_id_a` to `user_id_b`, making an ID with a tab the name of `u4` and `u1` |
 | L4 | `u1,u2`. `k1` for `c_1` by `u2` at 09:00, `k2` for `c_2` by `u1` at 08:00 | A linked ID's click credits the session; the latest across all the person's IDs wins, and both assist |
+
+## Extra edges (team Mysore Pak)
+
+Not part of the starter. Expected rows derived by hand from `rules.md`.
+
+| Case | Input | Catches |
+| --- | --- | --- |
+| X1 | Window 2028-02-20 to 2028-03-05. One user per edge: `2028-02-29` (kept), `2028-02-30`, hour 24, minute 60, second 60, month 00 (dropped); F2 offsets crossing the leap day both ways; F3 with 30 leading zeros (kept), 2^64+t and 2^63+t (dropped); prices with 30 leading zeros (kept), 2^64+250, `10000001`, `+250`, ` 250` (dropped), `10000000` (kept); quote anomalies `"uq`, `u"q`, `""uq""`, `"uq"x` (malformed), an all-quoted line (kept); `"5"\r` as last field (malformed) vs `5\r` on a view (kept); ingest exactly +24 h and before ts (kept); links `é1,z1` and `a1,Z1` (names `z1`, `Z1`: byte order); clicks `k9`/`k10` tied on ts (`k10` credits; both assist; a quoted duplicate of `k10`); a second events file without a trailing newline | Calendar validation inside the window, overflow-safe digit parsing, quote and `\r` dialect corners, byte-wise ordering of non-ASCII IDs and click IDs, final line without `\n` |
