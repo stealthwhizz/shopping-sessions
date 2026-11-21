@@ -3,6 +3,7 @@ mod parquet;
 mod profile;
 mod keys;
 mod scan;
+mod records;
 
 use input::{DAY, WEEK, Links, Map, body, chunks, csv, lines, map_dir, map_file, price};
 use scan::timestamp;
@@ -13,7 +14,7 @@ use memmap2::Mmap;
 use rayon::prelude::*;
 use std::{env, path::Path, sync::atomic::{AtomicBool, Ordering::Relaxed}, time::Instant};
 
-const INVALID: i64 = i64::MIN;
+use records::{Compact, Layout, Wide, INVALID};
 const DEDUP_BUCKETS: usize = 128;
 const USER_BUCKETS: usize = 32;
 
@@ -47,19 +48,17 @@ impl<'a> Catalog<'a> {
     }
 }
 
-struct RawEvent<K> {
+struct RawEvent<K, L: Layout> {
     id: K,
     user: K,
-    ts: i64,
     ingest: i64,
-    revenue: u32,
-    category: u32,
+    data: L::Data,
 }
 #[derive(Clone, Copy)]
-struct Event<K> { user: K, ts: i64, revenue: u32, category: u32 }
-struct Click<K> { user: K, id: K, ts: i64, campaign: u32 }
+struct Event<K, L: Layout> { user: K, data: L::Data }
+struct Click<K, L: Layout> { user: K, id: K, ts: L::Time, campaign: u32 }
 
-fn parse_events<'a, K: Key<'a>>(bytes: &'a [u8], catalog: &Catalog<'_>, start: i64, end: i64, unsupported: &AtomicBool) -> Vec<Vec<RawEvent<K>>> {
+fn parse_events<'a, K: Key<'a>, L: Layout>(bytes: &'a [u8], catalog: &Catalog<'_>, start: i64, end: i64, origin: i64, unsupported: &AtomicBool) -> Vec<Vec<RawEvent<K,L>>> {
     let _phase = Span::worker(Phase::EventParse);
     let mut rows: Vec<Vec<_>> = (0..DEDUP_BUCKETS).map(|_| Vec::with_capacity(bytes.len()/70/DEDUP_BUCKETS)).collect();
     scan::for_each_line::<7>(bytes, |f| {
@@ -89,12 +88,12 @@ fn parse_events<'a, K: Key<'a>>(bytes: &'a [u8], catalog: &Catalog<'_>, start: i
         }
         // Invalid earliest copies remain in dedup, so a later valid row cannot rescue them.
         let id_hash = id.fingerprint();
-        rows[(id_hash >> 57) as usize].push(RawEvent { id, user, ts, ingest, revenue, category });
+        rows[(id_hash >> 57) as usize].push(RawEvent { id, user, ingest, data: L::event(ts, revenue, category, origin) });
     });
     rows
 }
 
-fn parse_clicks<'a, K: Key<'a>>(bytes: &'a [u8], links: &Links<K>, catalog: &Catalog<'_>, start: i64, end: i64, unsupported: &AtomicBool) -> Vec<Click<K>> {
+fn parse_clicks<'a, K: Key<'a>, L: Layout>(bytes: &'a [u8], links: &Links<K>, catalog: &Catalog<'_>, start: i64, end: i64, origin: i64, unsupported: &AtomicBool) -> Vec<Click<K,L>> {
     let mut rows = Vec::with_capacity(bytes.len()/45);
     scan::for_each_line::<4>(bytes, |f| {
         let Some([id,user,campaign,ts]) = f else { return };
@@ -107,14 +106,14 @@ fn parse_clicks<'a, K: Key<'a>>(bytes: &'a [u8], links: &Links<K>, catalog: &Cat
         let user = links.name(user);
         // Click duplicates have identical values: repeating one changes neither the
         // winning click nor the per-campaign sliding-window counts' zero/nonzero state.
-        rows.push(Click { user, id, ts, campaign });
+        rows.push(Click { user, id, ts: L::click(ts, origin), campaign });
     });
     rows
 }
 
 
-fn sort_events<K: Copy+Ord>(events: &mut [Event<K>]) {
-    events.sort_unstable_by_key(|event| (event.user, event.ts));
+fn sort_events<K: Copy+Ord, L: Layout>(events: &mut [Event<K,L>]) {
+    events.sort_unstable_by_key(|event| (event.user, L::time(event.data)));
 }
 
 fn flatten<T>(parts: Vec<Vec<T>>) -> Vec<T> {
@@ -139,10 +138,10 @@ fn transpose<T>(parts: Vec<Vec<Vec<T>>>, count: usize) -> Vec<Vec<Vec<T>>> {
     buckets
 }
 
-fn dedup<'a, K: Key<'a>>(parts: Vec<Vec<RawEvent<K>>>, links: &Links<K>) -> Vec<Event<K>> {
+fn dedup<'a, K: Key<'a>, L: Layout>(parts: Vec<Vec<RawEvent<K,L>>>, links: &Links<K>) -> Vec<Event<K,L>> {
     let count: usize = parts.iter().map(Vec::len).sum();
     let capacity = (count * 2).max(1).next_power_of_two();
-    let mut table: Vec<Option<&RawEvent<K>>> = vec![None; capacity];
+    let mut table: Vec<Option<&RawEvent<K,L>>> = vec![None; capacity];
     for row in parts.iter().flatten() {
         let mut slot = row.id.fingerprint() as usize & (capacity-1);
         loop {
@@ -157,15 +156,15 @@ fn dedup<'a, K: Key<'a>>(parts: Vec<Vec<RawEvent<K>>>, links: &Links<K>) -> Vec<
         }
     }
     let mut events = Vec::with_capacity(count);
-    for row in table.into_iter().flatten().filter(|r| r.ts != INVALID) {
+    for row in table.into_iter().flatten().filter(|r| L::valid(r.data)) {
         let user = links.name(row.user);
-        events.push(Event { user, ts: row.ts, revenue: row.revenue, category: row.category });
+        events.push(Event { user, data: row.data });
     }
     events
 }
 
 struct Work { events: std::ops::Range<usize>, clicks: std::ops::Range<usize> }
-fn work<K: Copy+Ord>(events: &[Event<K>], clicks: &[Click<K>]) -> Vec<Work> {
+fn work<K: Copy+Ord, L: Layout>(events: &[Event<K,L>], clicks: &[Click<K,L>]) -> Vec<Work> {
     let mut result = Vec::new();
     let (mut e, mut c) = (0,0);
     while e < events.len() {
@@ -208,7 +207,7 @@ fn top_category(totals: &[(u32,i64)], names: &[&[u8]]) -> Option<u32> {
     totals.iter().max_by(|a,b| a.1.cmp(&b.1).then_with(|| names[b.0 as usize].cmp(names[a.0 as usize]))).map(|v| v.0)
 }
 
-fn person<K: Copy+Ord>(agg: &mut Aggregate<K>, events: &[Event<K>], clicks: &[Click<K>], categories: &[&[u8]]) {
+fn person<K: Copy+Ord, L: Layout>(agg: &mut Aggregate<K>, events: &[Event<K,L>], clicks: &[Click<K,L>], categories: &[&[u8]], origin: i64) {
     let mut active = Map::<u32,u32>::default();
     let (mut left, mut right, mut first) = (0,0,0);
     let mut daily: Option<UserRow<K>> = None;
@@ -217,10 +216,10 @@ fn person<K: Copy+Ord>(agg: &mut Aggregate<K>, events: &[Event<K>], clicks: &[Cl
     while first < events.len() {
         sampled = profile::sample();
         let phase = Span::sampled(Phase::SessionSample, sampled);
-        let start = events[first].ts;
-        let day = start.div_euclid(DAY) as i32;
+        let start = L::units(L::time(events[first].data));
+        let day = L::epoch(start, origin).div_euclid(DAY) as i32;
         let mut last = first+1;
-        while last < events.len() && events[last].ts-events[last-1].ts <= 1_800_000 { last += 1; }
+        while last < events.len() && L::units(L::time(events[last].data))-L::units(L::time(events[last-1].data)) <= 1_800_000 { last += 1; }
         drop(phase);
         let phase = Span::sampled(Phase::AggregationSample, sampled);
         if daily.as_ref().is_some_and(|row| row.day != day) {
@@ -231,20 +230,22 @@ fn person<K: Copy+Ord>(agg: &mut Aggregate<K>, events: &[Event<K>], clicks: &[Cl
         let row = daily.get_or_insert_with(|| UserRow { user: events[first].user, day, sessions: 0, events: 0, revenue: 0, category: None });
         let mut revenue = 0i64;
         for event in &events[first..last] {
-            revenue += event.revenue as i64;
-            if event.revenue > 0 {
-                if let Some(total) = category_totals.iter_mut().find(|v| v.0 == event.category) { total.1 += event.revenue as i64; }
-                else { category_totals.push((event.category, event.revenue as i64)); }
+            let amount = L::revenue(event.data);
+            let category = L::category(event.data);
+            revenue += i64::from(amount);
+            if amount > 0 {
+                if let Some(total) = category_totals.iter_mut().find(|v| v.0 == category) { total.1 += i64::from(amount); }
+                else { category_totals.push((category, i64::from(amount))); }
             }
         }
         row.sessions += 1; row.events += (last-first) as i64; row.revenue += revenue;
         drop(phase);
         let phase = Span::sampled(Phase::AttributionSample, sampled);
-        while right < clicks.len() && clicks[right].ts <= start {
+        while right < clicks.len() && L::units(clicks[right].ts) <= start {
             *active.entry(clicks[right].campaign).or_default() += 1;
             right += 1;
         }
-        while left < right && clicks[left].ts < start-WEEK {
+        while left < right && L::units(clicks[left].ts) < start-WEEK {
             let campaign = clicks[left].campaign;
             let count = active.get_mut(&campaign).unwrap(); *count -= 1;
             if *count == 0 { active.remove(&campaign); }
@@ -292,17 +293,18 @@ fn output_campaigns(path: &Path, totals: Vec<CampaignRow>, first_day: i32, days:
     ])
 }
 
-fn pipeline<'a, K: Key<'a>>(link_maps: &'a [Mmap], event_maps: &'a [Mmap], click_maps: &'a [Mmap], catalog: &Catalog<'_>, start: i64, end: i64, out: &Path) -> std::io::Result<bool> {
+fn pipeline<'a, K: Key<'a>, L: Layout>(link_maps: &'a [Mmap], event_maps: &'a [Mmap], click_maps: &'a [Mmap], catalog: &Catalog<'_>, start: i64, end: i64, out: &Path) -> std::io::Result<bool> {
     let clock = Instant::now();
     let first_day = start.div_euclid(DAY) as i32;
     let days = ((end-1).div_euclid(DAY)-i64::from(first_day)+1).max(0) as usize;
+    let origin = start-WEEK;
     let unsupported = AtomicBool::new(false);
     let (links, parts) = rayon::join(
         || {
             let _phase = Span::worker(Phase::Links);
             Links::<K>::new(link_maps, &unsupported)
         },
-        || chunks(event_maps).par_iter().map(|bytes| parse_events::<K>(bytes, catalog, start, end, &unsupported)).collect::<Vec<_>>(),
+        || chunks(event_maps).par_iter().map(|bytes| parse_events::<K,L>(bytes, catalog, start, end, origin, &unsupported)).collect::<Vec<_>>(),
     );
     if unsupported.load(Relaxed) { return Ok(false); }
     eprintln!("parse {:.3}s", clock.elapsed().as_secs_f64());
@@ -314,7 +316,7 @@ fn pipeline<'a, K: Key<'a>>(link_maps: &'a [Mmap], event_maps: &'a [Mmap], click
     eprintln!("dedup {:.3}s", clock.elapsed().as_secs_f64());
     let phase = Span::process(Phase::ClickParse);
     let clicks = transpose(chunks(&click_maps).par_iter().map(|bytes| {
-        partition(parse_clicks::<K>(bytes, &links, catalog, start, end, &unsupported), |click| click.user.fingerprint())
+        partition(parse_clicks::<K,L>(bytes, &links, catalog, start, end, origin, &unsupported), |click| click.user.fingerprint())
     }).collect(), USER_BUCKETS);
     drop(phase);
     if unsupported.load(Relaxed) { return Ok(false); }
@@ -336,7 +338,7 @@ fn pipeline<'a, K: Key<'a>>(link_maps: &'a [Mmap], event_maps: &'a [Mmap], click
         let mut agg = Aggregate::new(catalog.campaigns.len(), first_day, days);
         let phase = Span::worker(Phase::PersonFused);
         for group in groups {
-            person(&mut agg, &events[group.events], &clicks[group.clicks], &catalog.categories);
+            person(&mut agg, &events[group.events], &clicks[group.clicks], &catalog.categories, origin);
         }
         drop(phase);
         output_users(out, part, &agg.users, catalog)?;
@@ -367,6 +369,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some(value) if value == "string" => true,
         _ => return Err("SHOPPING_PATH must be packed or string".into()),
     };
+    let wide_mode = match env::var_os("SHOPPING_LAYOUT") {
+        None => false,
+        Some(value) if value == "compact" => false,
+        Some(value) if value == "wide" => true,
+        _ => return Err("SHOPPING_LAYOUT must be compact or wide".into()),
+    };
     let threads = env::var("NCPU").ok().and_then(|s| s.parse::<usize>().ok()).filter(|&n| n > 0)
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from));
     rayon::ThreadPoolBuilder::new().num_threads(threads).build_global()?;
@@ -388,13 +396,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let click_maps = map_dir(&data.join("clicks"))?;
     drop(phase);
     if string_mode {
-        pipeline::<&[u8]>(&link_maps, &event_maps, &click_maps, &catalog, start, end, Path::new(&out))?;
-        eprintln!("path=string reason=forced");
-    } else if pipeline::<u64>(&link_maps, &event_maps, &click_maps, &catalog, start, end, Path::new(&out))? {
-        eprintln!("path=packed");
+        pipeline::<&[u8],Wide>(&link_maps, &event_maps, &click_maps, &catalog, start, end, Path::new(&out))?;
+        eprintln!("path=string reason=forced layout=wide");
     } else {
-        eprintln!("path=string reason=unsupported-id");
-        pipeline::<&[u8]>(&link_maps, &event_maps, &click_maps, &catalog, start, end, Path::new(&out))?;
+        let packed = if !wide_mode && Compact::eligible(start, end, catalog.categories.len()) {
+            eprintln!("layout=compact");
+            pipeline::<u64,Compact>(&link_maps, &event_maps, &click_maps, &catalog, start, end, Path::new(&out))?
+        } else {
+            eprintln!("layout=wide");
+            pipeline::<u64,Wide>(&link_maps, &event_maps, &click_maps, &catalog, start, end, Path::new(&out))?
+        };
+        if packed { eprintln!("path=packed"); }
+        else {
+            eprintln!("path=string reason=unsupported-id layout=wide");
+            pipeline::<&[u8],Wide>(&link_maps, &event_maps, &click_maps, &catalog, start, end, Path::new(&out))?;
+        }
     }
     eprintln!("total {:.3}s", clock.elapsed().as_secs_f64());
     if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
@@ -418,6 +434,12 @@ fn main() {
 mod tests {
     use super::*;
     #[test]
+    fn compact_record_widths_reduce_memory_traffic() {
+        assert_eq!(std::mem::size_of::<RawEvent<u64,Compact>>(), 32);
+        assert_eq!(std::mem::size_of::<Event<u64,Compact>>(), 16);
+        assert_eq!(std::mem::size_of::<Click<u64,Compact>>(), 24);
+    }
+    #[test]
     fn dedup_keeps_invalid_earliest_and_distinguishes_hash_collisions() {
         #[derive(Clone,Copy,Eq,PartialEq,Ord,PartialOrd,Hash)]
         struct Collision<'a>(&'a [u8]);
@@ -426,25 +448,25 @@ mod tests {
             fn fingerprint(self) -> u64 { 7 }
             fn append_plain(self, data: &mut Vec<u8>) { self.0.append_plain(data); }
         }
-        let make = |id, ingest, ts| RawEvent { id: Collision(id), user: Collision(b"u"), ts, ingest, revenue: 0, category: 0 };
+        let make = |id, ingest, ts| RawEvent::<_,Wide> { id: Collision(id), user: Collision(b"u"), ingest, data: Wide::event(ts, 0, 0, 0) };
         let links = Links::new(&[], &AtomicBool::new(false));
         let result = dedup(vec![vec![make(&b"a"[..], 20, 100), make(&b"b"[..], 30, 200)], vec![make(&b"a"[..], 10, INVALID)]], &links);
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].ts, 200);
+        assert_eq!(Wide::time(result[0].data), 200);
     }
     #[test]
     fn event_sort_uses_exact_person_key_before_timestamp() {
-        let make = |user, ts| Event { user, ts, revenue: 0, category: 0 };
+        let make = |user, ts| Event::<_,Wide> { user, data: Wide::event(ts, 0, 0, 0) };
         let mut events = vec![make(2u64, 10), make(1, 30), make(1, 20), make(2, 25)];
         sort_events(&mut events);
-        assert_eq!(events.iter().map(|event| (event.user,event.ts)).collect::<Vec<_>>(), vec![
+        assert_eq!(events.iter().map(|event| (event.user,Wide::time(event.data))).collect::<Vec<_>>(), vec![
             (1, 20), (1, 30), (2, 10), (2, 25),
         ]);
     }
     #[test]
     fn bad_ingest_drops_only_that_row() {
         let catalog = Catalog::new(b"product_id,category\np,category\n", b"campaign_id,channel\n");
-        let rows = parse_events::<&[u8]>(b"bad,u,1,invalid,view,p,\ngood,u,2,1970-01-01T00:00:00Z,view,p,\n", &catalog, 0, DAY, &AtomicBool::new(false));
+        let rows = parse_events::<&[u8],Wide>(b"bad,u,1,invalid,view,p,\ngood,u,2,1970-01-01T00:00:00Z,view,p,\n", &catalog, 0, DAY, 0, &AtomicBool::new(false));
         let kept: Vec<_> = rows.iter().flatten().collect();
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].id, b"good");

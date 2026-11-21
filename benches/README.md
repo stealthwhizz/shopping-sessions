@@ -233,3 +233,13 @@ Medians of five instrumented 20M runs, CPUs 0-7, eight workers. Wall values for 
 Raw profile logs: `out-rust-cp5-bench/phase-logs/{1,2,3,4,5}.log` (generated, gitignored). Reproduce with the correctness and pinned-container commands above, changing the image to `shopping-rust-cp5`; the default path is packed with automatic exact fallback.
 
 Verified source and its paired native executable are saved at `/tmp/rust-good-5/`. The scanner module is included unchanged from ScanLab.
+
+## Checkpoint 6: compact event/click records
+
+The packed path now stores event time relative to `window_start - 7 days` in 32 bits, plus 24 revenue bits and eight category bits. Startup checks the complete click-window span with checked arithmetic, reserves `u32::MAX` for an invalid retained copy, and requires at most 256 catalog categories including `unknown`. Wider windows or catalogs select the original `i64`/`u32` representation before parsing. Ingest timestamps remain `i64`. `SHOPPING_LAYOUT=wide` forces this exact wide representation; forced-string and unsupported-ID fallback also use it.
+
+Both layouts instantiate the same rule-processing functions. Packed raw events shrink 40→32 bytes, surviving events 24→16, clicks 32→24. The record-width test first failed at 40 versus 32 bytes, then passed alongside boundary round-trip/startup-guard tests. Revenue totals and Parquet integer selection are unchanged.
+
+Observed: 13 unit tests; 37/37 fixtures and dev MATCH through compact, forced-wide, and forced-string paths; packed crosscheck 12/12 including 20M; container 37/37 and dev MATCH. Image `shopping-rust-cp6` is 78,718,573 bytes. Paired CPU0-7 20M runs gave checkpoint-five best/median **1.41/1.41 s**, compact records **1.32/1.33 s**, with all five pairs faster. Compact peak RSS was **2,997,120 KiB** (linear 60M extrapolation approximately **8.58 GiB**, not measured).
+
+The verified source and paired native executable are saved at `/tmp/rust-good-6/`.
