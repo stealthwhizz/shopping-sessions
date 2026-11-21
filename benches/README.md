@@ -374,3 +374,22 @@ and teardown **0.0421/0.0418**. Bucket event-sort CPU is **0.3173**, click-sort
 **0.0952**, grouping **0.1407**, scatter **0.1805**, fused processing **0.4655**,
 and Parquet **0.0960**. These bucket envelopes overlap and must not be added.
 
+## Dedup2 experiment: fused canonical resolution and routing
+
+On branch `exp/dedup2`, based on checkpoint 11, event dedup emits only valid winners with
+raw user IDs. `resolve_partition_events` then resolves each ID and counts its canonical
+person bucket in one pass, retaining a bucket byte per row for exact-capacity scatter.
+This replaces a separate resolve pass plus two canonical-ID fingerprint passes; click
+parsing and person processing are unchanged. Dedup still compares all copies before
+discarding an invalid winner, including copies naming different users.
+
+Nine interleaved 20M runs on **CPUs 8-11, NCPU=4**, with the Dockerfile's THP tunables
+exported: process wall **1.2700 -> 1.2597 s**; separately instrumented dedup CPU
+**0.9017 -> 0.8544 s**, dedup wall **0.2350 -> 0.2232 s**. These four-thread laptop
+numbers are not comparable to the eight-thread checkpoint timings above.
+
+Observed gates: 23 Rust tests; **37/37 fixtures and 20M MATCH** for compact/packed,
+wide/packed, and wide/string. A new differential test compares fused resolve/routing
+with the former separate passes, including linked and unlinked users, empty inputs,
+prefetch-boundary lengths, and all three key/layout combinations.
+
