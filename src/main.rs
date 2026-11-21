@@ -15,7 +15,13 @@ use rayon::prelude::*;
 use std::{env, path::Path, sync::atomic::{AtomicBool, Ordering::Relaxed}, time::Instant};
 
 use records::{Compact, Layout, Wide, INVALID};
-const DEDUP_BUCKETS: usize = 128;
+/// Raw event copies are routed into this many event_id-hash buckets at parse time so each
+/// bucket's dedup (about 20K rows at 20M events) works in L2. At most 2^16 (u16 bucket ids).
+const DEDUP_BITS: u32 = 10;
+const DEDUP_BUCKETS: usize = 1 << DEDUP_BITS;
+const _: () = assert!(DEDUP_BITS <= 16 && DEDUP_BUCKETS % DEDUP_TASKS == 0);
+/// Dedup tasks, each taking DEDUP_BUCKETS/DEDUP_TASKS consecutive buckets.
+const DEDUP_TASKS: usize = 128;
 const USER_BUCKETS: usize = 32;
 
 struct Catalog<'a> {
@@ -48,6 +54,7 @@ impl<'a> Catalog<'a> {
     }
 }
 
+#[derive(Clone, Copy)]
 struct RawEvent<K, L: Layout> {
     id: K,
     user: K,
@@ -58,9 +65,21 @@ struct RawEvent<K, L: Layout> {
 struct Event<K, L: Layout> { user: K, data: L::Data }
 struct Click<K, L: Layout> { user: K, id: K, ts: L::Time, campaign: u32 }
 
-fn parse_events<'a, K: Key<'a>, L: Layout>(bytes: &'a [u8], catalog: &Catalog<'_>, start: i64, end: i64, origin: i64, unsupported: &AtomicBool) -> Vec<Vec<RawEvent<K,L>>> {
+/// One chunk's raw event copies grouped by dedup bucket: bucket `b` is `rows[starts[b]..starts[b+1]]`.
+struct Routed<K, L: Layout> { rows: Vec<RawEvent<K,L>>, starts: Vec<u32> }
+impl<K, L: Layout> Routed<K,L> {
+    fn bucket(&self, b: usize) -> &[RawEvent<K,L>] { &self.rows[self.starts[b] as usize..self.starts[b+1] as usize] }
+}
+
+/// Parses into `scratch` (parse order plus each row's bucket), then counts-then-scatters into
+/// an exactly sized bucket-grouped copy. `scratch` is reused across chunks, so the scatter
+/// reads cache-hot rows and each routed row is written once.
+fn parse_events<'a, K: Key<'a>, L: Layout>(bytes: &'a [u8], catalog: &Catalog<'_>, start: i64, end: i64, origin: i64, unsupported: &AtomicBool,
+    scratch: &mut (Vec<RawEvent<K,L>>, Vec<u16>)) -> Routed<K,L> {
     let _phase = Span::worker(Phase::EventParse);
-    let mut rows: Vec<Vec<_>> = (0..DEDUP_BUCKETS).map(|_| Vec::with_capacity(bytes.len()/70/DEDUP_BUCKETS)).collect();
+    let (parsed, buckets) = scratch;
+    parsed.clear(); buckets.clear();
+    let mut starts = vec![0u32; DEDUP_BUCKETS+1];
     scan::for_each_line::<7>(bytes, |f| {
         let Some(f) = f else { return };
         if f[0].is_empty() { return; }
@@ -87,10 +106,24 @@ fn parse_events<'a, K: Key<'a>, L: Layout>(bytes: &'a [u8], catalog: &Catalog<'_
             if ts != INVALID && ingest - ts > DAY { ts = INVALID; }
         }
         // Invalid earliest copies remain in dedup, so a later valid row cannot rescue them.
-        let id_hash = id.fingerprint();
-        rows[(id_hash >> 57) as usize].push(RawEvent { id, user, ingest, data: L::event(ts, revenue, category, origin) });
+        let bucket = (id.fingerprint() >> (64-DEDUP_BITS)) as usize;
+        starts[bucket+1] += 1;
+        parsed.push(RawEvent { id, user, ingest, data: L::event(ts, revenue, category, origin) });
+        buckets.push(bucket as u16);
     });
-    rows
+    for b in 0..DEDUP_BUCKETS { starts[b+1] += starts[b]; }
+    let mut cursor = starts[..DEDUP_BUCKETS].to_vec();
+    let mut rows = Vec::<RawEvent<K,L>>::with_capacity(parsed.len());
+    let out = rows.as_mut_ptr();
+    for (row, &bucket) in parsed.iter().zip(buckets.iter()) {
+        let slot = &mut cursor[bucket as usize];
+        // SAFETY: cursors start at the prefix sums of the exact per-bucket counts, so each
+        // index in 0..parsed.len() is written exactly once before set_len.
+        unsafe { out.add(*slot as usize).write(*row); }
+        *slot += 1;
+    }
+    unsafe { rows.set_len(parsed.len()); }
+    Routed { rows, starts }
 }
 
 fn parse_clicks<'a, K: Key<'a>, L: Layout>(bytes: &'a [u8], links: &Links<K>, catalog: &Catalog<'_>, start: i64, end: i64, origin: i64, unsupported: &AtomicBool) -> Vec<Click<K,L>> {
@@ -146,26 +179,58 @@ fn transpose<T>(parts: Vec<Vec<Vec<T>>>, count: usize) -> Vec<Vec<Vec<T>>> {
     buckets
 }
 
-fn dedup<'a, K: Key<'a>, L: Layout>(parts: Vec<Vec<RawEvent<K,L>>>, links: &Links<K>) -> Vec<Event<K,L>> {
-    let count: usize = parts.iter().map(Vec::len).sum();
-    let capacity = (count * 2).max(1).next_power_of_two();
-    let mut table: Vec<Option<&RawEvent<K,L>>> = vec![None; capacity];
-    for row in parts.iter().flatten() {
-        let mut slot = row.id.fingerprint() as usize & (capacity-1);
-        loop {
-            match table[slot] {
-                None => { table[slot] = Some(row); break; }
-                Some(old) if old.id == row.id => {
-                    if row.ingest < old.ingest { table[slot] = Some(row); }
-                    break;
-                }
-                _ => slot = (slot+1) & (capacity-1),
+struct DedupScratch<K, L: Layout> { rows: Vec<RawEvent<K,L>>, hashes: Vec<u32>, seen: Vec<u64>, repeated: Vec<u64>, suspects: Vec<u32>, table: Vec<u32> }
+impl<K, L: Layout> Default for DedupScratch<K,L> {
+    fn default() -> Self { Self { rows: Vec::new(), hashes: Vec::new(), seen: Vec::new(), repeated: Vec::new(), suspects: Vec::new(), table: Vec::new() } }
+}
+
+/// Dedups each bucket in `buckets` across every chunk's copies. A bucket's rows are gathered
+/// into `s` (L2-sized) while a bitmap of 16 bits per row marks hash bits seen more than once.
+/// A row whose bit was seen once is the only copy of its event_id and is kept directly; only
+/// the suspects (true duplicates plus ~6% bit collisions) go through the exact index table
+/// that keeps the copy with the smallest ingest_ts.
+fn dedup<'a, K: Key<'a>, L: Layout>(parts: &[Routed<K,L>], buckets: std::ops::Range<usize>, links: &Links<K>, s: &mut DedupScratch<K,L>) -> Vec<Event<K,L>> {
+    let count: usize = parts.iter().map(|p| (p.starts[buckets.end]-p.starts[buckets.start]) as usize).sum();
+    let mut events = Vec::with_capacity(count);
+    let mut emit = |row: &RawEvent<K,L>| if L::valid(row.data) { events.push(Event { user: row.user, data: row.data }) };
+    for b in buckets {
+        s.rows.clear(); s.hashes.clear(); s.suspects.clear();
+        let n: usize = parts.iter().map(|p| p.bucket(b).len()).sum();
+        let mask = (n*16).max(64).next_power_of_two()-1;
+        s.seen.clear(); s.seen.resize((mask+1)/64, 0);
+        s.repeated.clear(); s.repeated.resize((mask+1)/64, 0);
+        for part in parts {
+            for row in part.bucket(b) {
+                let hash = row.id.fingerprint() as u32;
+                let bit = hash as usize & mask;
+                let (word, flag) = (bit >> 6, 1u64 << (bit & 63));
+                s.repeated[word] |= s.seen[word] & flag;
+                s.seen[word] |= flag;
+                s.rows.push(*row); s.hashes.push(hash);
             }
         }
-    }
-    let mut events = Vec::with_capacity(count);
-    for row in table.into_iter().flatten().filter(|r| L::valid(r.data)) {
-        events.push(Event { user: row.user, data: row.data });
+        for (i, (row, &hash)) in s.rows.iter().zip(&s.hashes).enumerate() {
+            let bit = hash as usize & mask;
+            if s.repeated[bit >> 6] & (1 << (bit & 63)) == 0 { emit(row); } else { s.suspects.push(i as u32); }
+        }
+        let capacity = (s.suspects.len()*2).max(2).next_power_of_two();
+        s.table.clear(); s.table.resize(capacity, u32::MAX);
+        for &i in &s.suspects {
+            let (row, hash) = (&s.rows[i as usize], s.hashes[i as usize]);
+            // High hash bits: suspects share their low (bitmap) bits with their colliders.
+            let mut slot = hash.rotate_left(13) as usize & (capacity-1);
+            loop {
+                let old = s.table[slot];
+                if old == u32::MAX { s.table[slot] = i; break; }
+                let kept = &s.rows[old as usize];
+                if s.hashes[old as usize] == hash && kept.id == row.id {
+                    if row.ingest < kept.ingest { s.table[slot] = i; }
+                    break;
+                }
+                slot = (slot+1) & (capacity-1);
+            }
+        }
+        for &i in &s.table { if i != u32::MAX { emit(&s.rows[i as usize]); } }
     }
     resolve(&mut events, links, |row| &mut row.user);
     events
@@ -312,14 +377,18 @@ fn pipeline<'a, K: Key<'a>, L: Layout>(link_maps: &'a [Mmap], event_maps: &'a [M
             let _phase = Span::worker(Phase::Links);
             Links::<K>::new(link_maps, &unsupported)
         },
-        || chunks(event_maps).par_iter().map(|bytes| parse_events::<K,L>(bytes, catalog, start, end, origin, &unsupported)).collect::<Vec<_>>(),
+        || chunks(event_maps).par_iter().map_init(|| (Vec::new(), Vec::new()), |scratch, bytes| {
+            parse_events::<K,L>(bytes, catalog, start, end, origin, &unsupported, scratch)
+        }).collect::<Vec<_>>(),
     );
     if unsupported.load(Relaxed) { return Ok(false); }
     eprintln!("parse {:.3}s", clock.elapsed().as_secs_f64());
     let phase = Span::process(Phase::Dedup);
-    let events = transpose(transpose(parts, DEDUP_BUCKETS).into_par_iter().map(|parts| {
-        partition(dedup(parts, &links), |event| event.user.fingerprint())
+    let per_task = DEDUP_BUCKETS/DEDUP_TASKS;
+    let events = transpose((0..DEDUP_TASKS).into_par_iter().map_init(DedupScratch::default, |scratch, task| {
+        partition(dedup(&parts, task*per_task..(task+1)*per_task, &links, scratch), |event| event.user.fingerprint())
     }).collect(), USER_BUCKETS);
+    drop(parts);
     drop(phase);
     eprintln!("dedup {:.3}s", clock.elapsed().as_secs_f64());
     let phase = Span::process(Phase::ClickParse);
@@ -458,9 +527,42 @@ mod tests {
         }
         let make = |id, ingest, ts| RawEvent::<_,Wide> { id: Collision(id), user: Collision(b"u"), ingest, data: Wide::event(ts, 0, 0, 0) };
         let links = Links::new(&[], &AtomicBool::new(false));
-        let result = dedup(vec![vec![make(&b"a"[..], 20, 100), make(&b"b"[..], 30, 200)], vec![make(&b"a"[..], 10, INVALID)]], &links);
+        // Fingerprint 7 routes every copy to bucket 0.
+        let routed = |rows: Vec<_>| { let mut starts = vec![rows.len() as u32; DEDUP_BUCKETS+1]; starts[0] = 0; Routed { rows, starts } };
+        let parts = [routed(vec![make(&b"a"[..], 20, 100), make(&b"b"[..], 30, 200)]), routed(vec![make(&b"a"[..], 10, INVALID)])];
+        let result = dedup(&parts, 0..1, &links, &mut DedupScratch::default());
         assert_eq!(result.len(), 1);
         assert_eq!(Wide::time(result[0].data), 200);
+    }
+    #[test]
+    fn dedup_matches_smallest_ingest_reference_across_chunks_and_buckets() {
+        let catalog = Catalog::new(b"product_id,category\np,category\n", b"campaign_id,channel\n");
+        let (start, end) = (1, 1001);
+        let mut state = 7u64;
+        let mut text = Vec::new();
+        let mut expected = std::collections::BTreeMap::new();
+        for _ in 0..20_000 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let id = (state >> 33) % 6000;
+            let ingest = ((state >> 20) % 1000) as i64;
+            let ts = ingest - ((state >> 50) % 2) as i64;
+            text.extend_from_slice(format!("e{id},u{},{ts},{ingest},view,p,\n", ingest % 3).as_bytes());
+            let best = expected.entry(id).or_insert((ingest, ts));
+            if ingest < best.0 { *best = (ingest, ts); }
+        }
+        let (mut parts, mut scratch, mut rest) = (Vec::new(), (Vec::new(), Vec::new()), &text[..]);
+        while !rest.is_empty() {
+            let cut = rest.len().min(30_000);
+            let end_of_line = rest[cut..].iter().position(|&b| b == b'\n').map_or(rest.len(), |p| cut+p+1);
+            parts.push(parse_events::<u64,Wide>(&rest[..end_of_line], &catalog, start, end, 0, &AtomicBool::new(false), &mut scratch));
+            rest = &rest[end_of_line..];
+        }
+        assert!(parts.len() > 3);
+        let links = Links::new(&[], &AtomicBool::new(false));
+        let mut kept: Vec<_> = dedup(&parts, 0..DEDUP_BUCKETS, &links, &mut DedupScratch::default()).iter().map(|e| Wide::time(e.data)).collect();
+        let mut reference: Vec<_> = expected.values().filter(|&&(_, ts)| ts >= start && ts < end).map(|&(_, ts)| ts).collect();
+        kept.sort_unstable(); reference.sort_unstable();
+        assert_eq!(kept, reference);
     }
     #[test]
     fn event_sort_uses_exact_person_key_before_timestamp() {
@@ -474,9 +576,8 @@ mod tests {
     #[test]
     fn bad_ingest_drops_only_that_row() {
         let catalog = Catalog::new(b"product_id,category\np,category\n", b"campaign_id,channel\n");
-        let rows = parse_events::<&[u8],Wide>(b"bad,u,1,invalid,view,p,\ngood,u,2,1970-01-01T00:00:00Z,view,p,\n", &catalog, 0, DAY, 0, &AtomicBool::new(false));
-        let kept: Vec<_> = rows.iter().flatten().collect();
-        assert_eq!(kept.len(), 1);
-        assert_eq!(kept[0].id, b"good");
+        let rows = parse_events::<&[u8],Wide>(b"bad,u,1,invalid,view,p,\ngood,u,2,1970-01-01T00:00:00Z,view,p,\n", &catalog, 0, DAY, 0, &AtomicBool::new(false), &mut (Vec::new(), Vec::new()));
+        assert_eq!(rows.rows.len(), 1);
+        assert_eq!(rows.rows[0].id, b"good");
     }
 }

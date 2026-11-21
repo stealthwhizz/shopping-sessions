@@ -274,3 +274,17 @@ Dedup survivors and validated clicks first retain their raw user IDs, then a sep
 Five three-way paired 20M runs (CPUs 0-7, allocator tunables exported) measured checkpoint seven **1.24 s best / 1.25 s median**, separate-key/value flat arrays **1.15/1.19 s**, and retained interleaved slots **1.14/1.14 s**, peak **3,038,184 KiB**. Absolute clocks were affected by concurrent work; only paired comparisons are used for the decision.
 
 Observed gates for the retained interleaved version: 16 tests; 37/37 fixtures and dev MATCH for compact/wide/string; packed crosscheck 12/12 including 20M; container 37/37 and dev MATCH. Image `shopping-rust-cp8` is **78,717,280 bytes**. The exact source and paired executable are saved at `/tmp/rust-good-8/`.
+
+### Dense-person indexing decision
+
+Counting/scattering by an exact local person index, followed by per-person timestamp sorts, passed 18 tests and all compact/wide/string fixture/dev gates. However, quiet paired medians were **1.02 s versus 1.02 s** for full sorting. Recording indices during counting avoided the second lookup but produced only small/noisy bucket-stage gains and extra buffers. Neither implementation was retained; the temporary module and its obsolete call sites were removed.
+
+## Checkpoint 9: count/scatter routing and exact suspect dedup
+
+RunLevel's measured design is ported onto checkpoint eight. Each parsed chunk reuses a scratch buffer, counts 1024 event-ID hash buckets, then scatters into one exactly sized routed vector with 1025 prefix offsets. There are still 128 dedup tasks, each handling eight buckets. Each bucket is gathered into reusable cache-sized scratch.
+
+Two bitmaps identify hash bits seen more than once. A singleton bit proves that row's ID has no duplicate; repeated bits send every associated row, including invalid copies, through exact ID comparison and smallest-ingest selection. Hash collisions only add suspects and never merge identities. Canonical person resolution remains the separate prefetched flat-table pass from checkpoint eight.
+
+Five paired CPU0-7 20M runs with the required tunables improved checkpoint-eight best/median **0.99/1.01 s** to **0.88/0.89 s**, all five pairs faster. Peak routed-version RSS was **2,793,860 KiB**, approximately **8.00 GiB** if linearly extrapolated to 60M (not a 60M measurement). Adding a 4 MiB malloc mmap threshold was near noise and was not retained.
+
+Observed gates: 17 tests, including the 20K-row multi-chunk smallest-ingest reference test; 37/37 fixtures and dev MATCH compact/wide/string; packed crosscheck 12/12 including 20M; container 37/37 and dev MATCH. Image `shopping-rust-cp9` is **78,723,423 bytes**. Verified source and paired executable: `/tmp/rust-good-9/`.
