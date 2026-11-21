@@ -4,8 +4,9 @@ mod profile;
 mod keys;
 mod scan;
 mod records;
+mod identity;
 
-use input::{DAY, WEEK, Links, Map, body, chunks, csv, lines, map_dir, map_file, price};
+use input::{DAY, WEEK, LinkKey, Links, Map, body, chunks, csv, lines, map_dir, map_file, price};
 use scan::timestamp;
 use parquet::Column;
 use profile::{Phase, Span};
@@ -25,7 +26,7 @@ const DEDUP_TASKS: usize = 128;
 const USER_BUCKETS: usize = 32;
 
 struct Catalog<'a> {
-    products: Map<&'a [u8], u32>,
+    products: Products<'a>,
     categories: Vec<&'a [u8]>,
     campaign_ids: Map<&'a [u8], u32>,
     campaigns: Vec<(&'a [u8], &'a [u8])>,
@@ -35,13 +36,13 @@ impl<'a> Catalog<'a> {
         let mut categories = vec![&b"unknown"[..]];
         let mut category_ids = Map::default();
         category_ids.insert(&b"unknown"[..], 0);
-        let mut product_map = Map::default();
+        let mut product_rows = Vec::new();
         for line in lines(body(products)) {
             let Some([product, category]) = csv::<2>(line) else { continue };
             let id = *category_ids.entry(category).or_insert_with(|| {
                 let id = categories.len() as u32; categories.push(category); id
             });
-            product_map.insert(product, id);
+            product_rows.push((product, id));
         }
         let mut campaign_ids = Map::default();
         let mut campaign_rows = vec![(&b"organic"[..], &b"organic"[..])];
@@ -50,7 +51,40 @@ impl<'a> Catalog<'a> {
             campaign_ids.insert(id, campaign_rows.len() as u32);
             campaign_rows.push((id, channel));
         }
-        Self { products: product_map, categories, campaign_ids, campaigns: campaign_rows }
+        Self { products: Products::new(&product_rows), categories, campaign_ids, campaigns: campaign_rows }
+    }
+}
+
+/// Exact product/category lookup; later dimension rows replace earlier ones.
+struct Products<'a> { slots: Vec<(u64, u32)>, other: Map<&'a [u8], u32> }
+impl<'a> Products<'a> {
+    fn new(rows: &[(&'a [u8], u32)]) -> Self {
+        let packable = rows.iter().filter(|row| keys::pack(row.0).is_some_and(|key| key != 0)).count();
+        let mut slots = vec![(0u64, 0u32); (packable*2).max(2).next_power_of_two()];
+        let mut other = Map::default();
+        for &(product, category) in rows {
+            // Zero is the empty slot marker, so the empty ID uses the exact byte map.
+            match keys::pack(product) {
+                Some(key) if key != 0 => {
+                    let slot = Self::slot(&slots, key);
+                    slots[slot] = (key, category);
+                }
+                _ => { other.insert(product, category); }
+            }
+        }
+        Self { slots, other }
+    }
+    fn slot(slots: &[(u64, u32)], key: u64) -> usize {
+        let mask = slots.len()-1;
+        let mut slot = key.fingerprint() as usize & mask;
+        while slots[slot].0 != 0 && slots[slot].0 != key { slot = (slot+1) & mask; }
+        slot
+    }
+    fn get(&self, product: &[u8]) -> u32 {
+        match keys::pack(product) {
+            Some(key) if key != 0 => self.slots[Self::slot(&self.slots, key)].1,
+            _ => self.other.get(product).copied().unwrap_or(0),
+        }
     }
 }
 
@@ -98,7 +132,7 @@ fn parse_events<'a, K: Key<'a>, L: Layout>(bytes: &'a [u8], catalog: &Catalog<'_
                 b"purchase" => {
                     if let Some(p) = price(f[6]) {
                         revenue = p;
-                        category = catalog.products.get(f[5]).copied().unwrap_or(0);
+                        category = catalog.products.get(f[5]);
                     } else { ts = INVALID; }
                 }
                 _ => ts = INVALID,
@@ -366,7 +400,7 @@ fn output_campaigns(path: &Path, totals: Vec<CampaignRow>, first_day: i32, days:
     ])
 }
 
-fn pipeline<'a, K: Key<'a>, L: Layout>(link_maps: &'a [Mmap], event_maps: &'a [Mmap], click_maps: &'a [Mmap], catalog: &Catalog<'_>, start: i64, end: i64, out: &Path) -> std::io::Result<bool> {
+fn pipeline<'a, K: LinkKey<'a>, L: Layout>(link_maps: &'a [Mmap], event_maps: &'a [Mmap], click_maps: &'a [Mmap], catalog: &Catalog<'_>, start: i64, end: i64, out: &Path) -> std::io::Result<bool> {
     let clock = Instant::now();
     let first_day = start.div_euclid(DAY) as i32;
     let days = ((end-1).div_euclid(DAY)-i64::from(first_day)+1).max(0) as usize;
@@ -374,7 +408,6 @@ fn pipeline<'a, K: Key<'a>, L: Layout>(link_maps: &'a [Mmap], event_maps: &'a [M
     let unsupported = AtomicBool::new(false);
     let (links, parts) = rayon::join(
         || {
-            let _phase = Span::worker(Phase::Links);
             Links::<K>::new(link_maps, &unsupported)
         },
         || chunks(event_maps).par_iter().map_init(|| (Vec::new(), Vec::new()), |scratch, bytes| {
@@ -511,6 +544,14 @@ fn main() {
 mod tests {
     use super::*;
     #[test]
+    fn product_lookup_keeps_last_row_exact_ids_and_unknown() {
+        let catalog = Catalog::new(b"product_id,category\np1,a\np2,b\np1,c\n\"p 3\",d\n,e\nP1,f\nabcdefghijk,g\n", b"campaign_id,channel\n");
+        let name = |product: &[u8]| catalog.categories[catalog.products.get(product) as usize];
+        for (product, category) in [(&b"p1"[..], &b"c"[..]), (b"p2", b"b"), (b"p 3", b"d"), (b"", b"e"), (b"P1", b"f"), (b"abcdefghijk", b"g"), (b"p4", b"unknown"), (b"p10", b"unknown")] {
+            assert_eq!(name(product), category, "{product:?}");
+        }
+    }
+    #[test]
     fn compact_record_widths_reduce_memory_traffic() {
         assert_eq!(std::mem::size_of::<RawEvent<u64,Compact>>(), 32);
         assert_eq!(std::mem::size_of::<Event<u64,Compact>>(), 16);
@@ -525,6 +566,7 @@ mod tests {
             fn fingerprint(self) -> u64 { 7 }
             fn append_plain(self, data: &mut Vec<u8>) { self.0.append_plain(data); }
         }
+        impl<'a> LinkKey<'a> for Collision<'a> {}
         let make = |id, ingest, ts| RawEvent::<_,Wide> { id: Collision(id), user: Collision(b"u"), ingest, data: Wide::event(ts, 0, 0, 0) };
         let links = Links::new(&[], &AtomicBool::new(false));
         // Fingerprint 7 routes every copy to bucket 0.

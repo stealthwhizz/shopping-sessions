@@ -288,3 +288,51 @@ Two bitmaps identify hash bits seen more than once. A singleton bit proves that 
 Five paired CPU0-7 20M runs with the required tunables improved checkpoint-eight best/median **0.99/1.01 s** to **0.88/0.89 s**, all five pairs faster. Peak routed-version RSS was **2,793,860 KiB**, approximately **8.00 GiB** if linearly extrapolated to 60M (not a 60M measurement). Adding a 4 MiB malloc mmap threshold was near noise and was not retained.
 
 Observed gates: 17 tests, including the 20K-row multi-chunk smallest-ingest reference test; 37/37 fixtures and dev MATCH compact/wide/string; packed crosscheck 12/12 including 20M; container 37/37 and dev MATCH. Image `shopping-rust-cp9` is **78,723,423 bytes**. Verified source and paired executable: `/tmp/rust-good-9/`.
+
+### Full raw-work overlap decision
+
+Running raw event dedup and raw click parsing alongside links, then resolving/partitioning after the join, passed 17 tests and all compact/wide/string fixture/dev checks. The links work was hidden, but the separate resolve stage cost about 0.11 s. Five paired process medians were **0.94 s versus 0.94 s**, with the overlapped variant slower in three pairs and peak RSS rising to 3,064,048 KiB. It was not retained; scheduling, signatures, logs and experimental profiling changes were restored to checkpoint nine.
+
+## Checkpoint 10: parallel links and lower-instruction parsing
+
+Link lines are parsed/packed in parallel, endpoints are interned with exact atomic CAS, and
+union-find hooks the root with the larger immutable packed key under the smaller root.
+Path halving and phase barriers preserve exact minimum-byte names; final lookup slots retain
+the previous plain `(ID, name)` layout. The exact byte-string path remains sequential.
+An independent adversarial review found no defect, including 25,000 amplified random graphs,
+500 faithful graphs, multi-chunk inputs, and three detected planted mutants.
+
+RunLevel's calendar table, eight-byte SWAR ID packing and flat product/category lookup are
+ported without narrowing accepted input. Other calendar years and unpackable product IDs
+retain exact fallbacks. The new calendar and every-byte packing regression tests bring the
+unit-test count to 22.
+
+Five paired 20M runs, CPU0-7 with the allocator tunables, improve checkpoint-nine best/median
+**0.90/0.92 s** to **0.88/0.89 s**, with every pair faster. Parallel links alone was neutral
+end to end; removing the serial links bound lets the parse improvements reduce wall time.
+The isolated links benchmark measures sequential **0.2553/0.2608 s** versus parallel
+**0.0400/0.0407 s** best/median:
+
+```sh
+GLIBC_TUNABLES=glibc.malloc.hugetlb=1:glibc.malloc.top_pad=268435456 \
+DATA_DIR=data/s20m-2 NCPU=8 taskset -c 0-7 \
+cargo test --release --bench links build_links -- --ignored --nocapture
+```
+
+A separate five-run native/container series measured the following process/container
+start-to-exit times. Container lifetime comes from Podman's StartedAt/FinishedAt, with
+`taskset -c 0-7` as the entrypoint, scorer flags, 8 CPUs and 12 GiB. Docker-client median
+times, including engine overhead, were 0.147 s for dev and 0.985 s for 20M.
+
+| Dataset | Native best/median | Native peak KiB | Container best/median | Container peak KiB |
+|---|---:|---:|---:|---:|
+| dev, 1M | 0.0510/0.0529 s | 179,496 | 0.0512/0.0544 s | 179,660 |
+| s20m-2, 20M | 0.8683/0.8777 s | 2,814,660 | 0.8729/0.8840 s | 2,821,916 |
+
+Linear 60M peak extrapolation is approximately **8.08 GiB**, not a 60M measurement.
+Observed gates: 22 tests; 37/37 fixtures and dev MATCH compact/wide/string; 20M MATCH;
+packed crosscheck 12/12; container 37/37 and dev MATCH. Scanner lab: 197 files,
+30M generated CSV lines across N=2/4/7, 9.24M calendar cases and 10M mutated timestamps,
+all **0 mismatches**. Image `shopping-rust-cp10`: **78,857,568 bytes**; measured
+dependency-cached image build **13.65 s** (Rust compile 8.04 s).
+

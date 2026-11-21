@@ -2,6 +2,7 @@ use memchr::{memchr, memchr_iter};
 use memmap2::{Mmap, MmapOptions};
 use std::{collections::HashMap, fs::{self, File}, hash::{BuildHasherDefault, Hasher}, io, path::Path};
 use crate::keys::Key;
+use crate::profile::{Phase, Span};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
 pub const DAY: i64 = 86_400_000;
@@ -156,9 +157,26 @@ pub fn window(path: &Path) -> Result<(i64,i64), Box<dyn std::error::Error>> {
     Ok((value("\"window_start\"").ok_or("invalid window_start")?, value("\"window_end\"").ok_or("invalid window_end")?))
 }
 
+pub trait LinkKey<'a>: Key<'a> {
+    fn build(maps: &'a [Mmap], unsupported: &AtomicBool) -> Links<Self> {
+        Links::sequential(maps, unsupported)
+    }
+}
+impl<'a> LinkKey<'a> for &'a [u8] {}
+impl<'a> LinkKey<'a> for u64 {
+    fn build(maps: &'a [Mmap], unsupported: &AtomicBool) -> Links<Self> {
+        let (ids,mask) = crate::identity::build(maps, unsupported);
+        Links { ids, mask, empty: 0 }
+    }
+}
+
 pub struct Links<K> { ids: Vec<(K,K)>, mask: usize, empty: K }
 impl<K> Links<K> {
-    pub fn new<'a>(maps: &'a [Mmap], unsupported: &AtomicBool) -> Self where K: Key<'a> {
+    pub fn new<'a>(maps: &'a [Mmap], unsupported: &AtomicBool) -> Self where K: LinkKey<'a> {
+        K::build(maps, unsupported)
+    }
+    fn sequential<'a>(maps: &'a [Mmap], unsupported: &AtomicBool) -> Self where K: Key<'a> {
+        let _phase = Span::worker(Phase::Links);
         let rows: usize = maps.iter().map(|map| {
             let bytes = body(map);
             memchr_iter(b'\n', bytes).count() + usize::from(!bytes.is_empty() && bytes.last() != Some(&b'\n'))
@@ -233,6 +251,42 @@ mod tests {
         map.make_read_only().unwrap()
     }
     #[test]
+    fn concurrent_links_match_exact_reference_across_thread_counts() {
+        let labels: Vec<_> = (0..32768).map(|i| format!("u{i}").into_bytes()).collect();
+        let mut edges: Vec<_> = (17..labels.len()).map(|i| (i,i-17)).collect();
+        edges.extend((17..labels.len()).step_by(13).map(|i| (i,i-17)));
+        let mut state = 9u64;
+        for i in (1..edges.len()).rev() {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            edges.swap(i,state as usize%(i+1));
+        }
+        let mut bytes = b"left,right\n".to_vec();
+        for (a,b) in edges {
+            bytes.extend_from_slice(&labels[a]); bytes.push(b',');
+            bytes.extend_from_slice(&labels[b]); bytes.push(b'\n');
+        }
+        for i in 0..17 { bytes.extend_from_slice(format!("g{i},u{i}\n").as_bytes()); }
+        bytes.extend_from_slice(b"Z,ZZ");
+        let maps = [mapped(&bytes)];
+        let unsupported = AtomicBool::new(false);
+        let reference = Links::<&[u8]>::new(&maps,&unsupported);
+        for threads in [1,2,8] {
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+            let parallel = pool.install(|| Links::<u64>::new(&maps,&unsupported));
+            for label in &labels {
+                let id = crate::keys::pack(label).unwrap();
+                let mut name = [0;10];
+                let length = crate::keys::unpack(parallel.name(id),&mut name);
+                assert_eq!(&name[..length],reference.name(label));
+            }
+            let z = crate::keys::pack(b"Z").unwrap();
+            assert_eq!(parallel.name(crate::keys::pack(b"ZZ").unwrap()),z);
+            let absent = crate::keys::pack(b"unlinked").unwrap();
+            assert_eq!(parallel.name(absent),absent);
+        }
+        assert!(!unsupported.load(Relaxed));
+    }
+    #[test]
     fn flat_links_keep_exact_identity_through_collisions_and_transitive_unions() {
         #[derive(Clone,Copy,Debug,Eq,PartialEq,Ord,PartialOrd,Hash)]
         struct Collision(u64);
@@ -241,6 +295,7 @@ mod tests {
             fn fingerprint(self) -> u64 { 7 }
             fn append_plain(self, bytes: &mut Vec<u8>) { self.0.append_plain(bytes); }
         }
+        impl LinkKey<'_> for Collision {}
         let maps = [mapped(b"left,right\nq,a\nb,q\nc,b\nq,q\n\n,x")];
         let unsupported = AtomicBool::new(false);
         let links = Links::<Collision>::new(&maps, &unsupported);

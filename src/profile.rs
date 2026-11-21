@@ -115,7 +115,7 @@ mod enabled {
                 eprintln!("PROFILE sampled_phase={} estimated_worker_wall_sum={estimated_work:.6} calls={calls}", NAMES[i]);
                 continue;
             }
-            let wall = if (i <= Phase::ClickParse as usize && i != Phase::EventParse as usize) || i == Phase::Teardown as usize { work_wall } else { envelope };
+            let wall = if (i <= Phase::ClickParse as usize && i != Phase::EventParse as usize && i != Phase::Links as usize) || i == Phase::Teardown as usize { work_wall } else { envelope };
             eprintln!("PROFILE phase={} wall={:.6} work_wall={:.6} cpu={:.6} avg_threads={:.3} calls={calls}", NAMES[i], wall as f64/1e9, work_wall as f64/1e9, cpu as f64/1e9, cpu as f64/wall.max(1) as f64);
         }
     }
