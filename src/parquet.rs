@@ -84,10 +84,10 @@ impl Column {
     }
 }
 
-pub fn write(path: &Path, rows: usize, columns: Vec<Column>) -> io::Result<()> {
-    let _phase = crate::profile::Span::process(crate::profile::Phase::ParquetWrite);
+pub fn write(path: &Path, part: usize, rows: usize, columns: Vec<Column>) -> io::Result<()> {
+    let _phase = crate::profile::Span::worker(crate::profile::Phase::ParquetWrite);
     fs::create_dir_all(path)?;
-    let mut file = File::create(path.join("part-00000.parquet"))?;
+    let mut file = File::create(path.join(format!("part-{part:05}.parquet")))?;
     file.write_all(b"PAR1")?;
     let mut offset = 4i64;
     let mut schemas = Vec::with_capacity(columns.len()+1);

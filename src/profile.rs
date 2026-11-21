@@ -1,7 +1,7 @@
 //! Compile with `--features phase-profile`; all guards are zero-sized no-ops otherwise.
 #[derive(Clone, Copy)]
 #[repr(usize)]
-pub enum Phase { Startup, Mmap, Links, Catalog, EventParse, Dedup, ClickParse, BucketCopy, EventSort, ClickSort, Grouping, PersonFused, CampaignMerge, Parquet, Teardown, SessionSample, AttributionSample, AggregationSample, OutputSort, ParquetWrite }
+pub enum Phase { Startup, Mmap, Links, Catalog, EventParse, Dedup, ClickParse, BucketCopy, EventSort, ClickSort, Grouping, PersonFused, CampaignMerge, Parquet, Teardown, SessionSample, AttributionSample, AggregationSample, ParquetWrite }
 
 pub struct Span {
     #[cfg(feature = "phase-profile")]
@@ -51,8 +51,8 @@ pub fn report() {
 mod enabled {
     use super::Phase;
     use std::{cell::Cell, sync::{LazyLock, atomic::{AtomicU64, Ordering::Relaxed}}, time::Instant};
-    const COUNT: usize = 20;
-    const NAMES: [&str;COUNT] = ["startup", "file_mmap", "links_union_find", "catalogs", "event_parse_validate", "event_dedup_partition", "click_parse_validate_partition", "bucket_copy", "event_sort", "click_sort", "person_group_discovery", "person_fused", "campaign_reduce", "parquet_sort_encode_write", "exit_unmap", "sessionize_sample", "credit_assists_sample", "aggregation_sample", "output_sort", "parquet_write_only"];
+    const COUNT: usize = 19;
+    const NAMES: [&str;COUNT] = ["startup", "file_mmap", "links_union_find", "catalogs", "event_parse_validate", "event_dedup_partition", "click_parse_validate_partition", "bucket_copy", "event_sort", "click_sort", "person_group_discovery", "person_fused", "campaign_reduce", "parquet_encode_write", "exit_unmap", "sessionize_sample", "credit_assists_sample", "aggregation_sample", "parquet_write_only"];
     static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
     struct Record { calls: AtomicU64, wall: AtomicU64, cpu: AtomicU64, first: AtomicU64, last: AtomicU64 }
     impl Record {
@@ -115,7 +115,7 @@ mod enabled {
                 eprintln!("PROFILE sampled_phase={} estimated_worker_wall_sum={estimated_work:.6} calls={calls}", NAMES[i]);
                 continue;
             }
-            let wall = if i <= Phase::ClickParse as usize || i == Phase::Parquet as usize || i == Phase::Teardown as usize || i >= Phase::OutputSort as usize { work_wall } else { envelope };
+            let wall = if (i <= Phase::ClickParse as usize && i != Phase::EventParse as usize) || i == Phase::Teardown as usize { work_wall } else { envelope };
             eprintln!("PROFILE phase={} wall={:.6} work_wall={:.6} cpu={:.6} avg_threads={:.3} calls={calls}", NAMES[i], wall as f64/1e9, work_wall as f64/1e9, cpu as f64/1e9, cpu as f64/wall.max(1) as f64);
         }
     }

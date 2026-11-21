@@ -55,12 +55,13 @@ struct RawEvent<'a> {
 struct Event<'a> { user: &'a [u8], user_hash: u64, ts: i64, revenue: u32, category: u32 }
 struct Click<'a> { user: &'a [u8], user_hash: u64, id: &'a [u8], ts: i64, campaign: u32 }
 
-fn parse_events<'a>(bytes: &'a [u8], links: &Links<'a>, catalog: &Catalog<'_>, start: i64, end: i64) -> Vec<Vec<RawEvent<'a>>> {
+fn parse_events<'a>(bytes: &'a [u8], catalog: &Catalog<'_>, start: i64, end: i64) -> Vec<Vec<RawEvent<'a>>> {
+    let _phase = Span::worker(Phase::EventParse);
     let mut rows: Vec<Vec<_>> = (0..DEDUP_BUCKETS).map(|_| Vec::with_capacity(bytes.len()/70/DEDUP_BUCKETS)).collect();
     for line in lines(bytes) {
         let Some(f) = csv::<7>(line) else { continue };
         if f[0].is_empty() { continue; }
-        let ingest = timestamp(f[3]).expect("ingest_ts must be valid F1");
+        let Some(ingest) = timestamp(f[3]) else { continue };
         let mut ts = timestamp(f[2]).unwrap_or(INVALID);
         let mut revenue = 0;
         let mut category = 0;
@@ -81,7 +82,7 @@ fn parse_events<'a>(bytes: &'a [u8], links: &Links<'a>, catalog: &Catalog<'_>, s
         }
         // Invalid earliest copies remain in dedup, so a later valid row cannot rescue them.
         let id_hash = hash(f[0]);
-        rows[(id_hash >> 57) as usize].push(RawEvent { id_hash, id: f[0], user: links.name(f[1]), ts, ingest, revenue, category });
+        rows[(id_hash >> 57) as usize].push(RawEvent { id_hash, id: f[0], user: f[1], ts, ingest, revenue, category });
     }
     rows
 }
@@ -141,7 +142,7 @@ fn transpose<T>(parts: Vec<Vec<Vec<T>>>, count: usize) -> Vec<Vec<Vec<T>>> {
     buckets
 }
 
-fn dedup<'a>(parts: Vec<Vec<RawEvent<'a>>>) -> Vec<Event<'a>> {
+fn dedup<'a>(parts: Vec<Vec<RawEvent<'a>>>, links: &Links<'a>) -> Vec<Event<'a>> {
     let count: usize = parts.iter().map(Vec::len).sum();
     let capacity = (count * 2).max(1).next_power_of_two();
     let mut table: Vec<Option<&RawEvent<'a>>> = vec![None; capacity];
@@ -160,7 +161,8 @@ fn dedup<'a>(parts: Vec<Vec<RawEvent<'a>>>) -> Vec<Event<'a>> {
     }
     let mut events = Vec::with_capacity(count);
     for row in table.into_iter().flatten().filter(|r| r.ts != INVALID) {
-        events.push(Event { user: row.user, user_hash: hash(row.user), ts: row.ts, revenue: row.revenue, category: row.category });
+        let user = links.name(row.user);
+        events.push(Event { user, user_hash: hash(user), ts: row.ts, revenue: row.revenue, category: row.category });
     }
     events
 }
@@ -182,7 +184,7 @@ fn work(events: &[Event<'_>], clicks: &[Click<'_>]) -> Vec<Work> {
 }
 
 struct UserRow<'a> { user: &'a [u8], day: i32, sessions: i64, events: i64, revenue: i64, category: Option<u32> }
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 struct CampaignRow { sessions: i64, purchasing: i64, revenue: i64, assists: i64 }
 impl CampaignRow {
     fn add(&mut self, other: Self) {
@@ -190,8 +192,20 @@ impl CampaignRow {
         self.revenue += other.revenue; self.assists += other.assists;
     }
 }
-#[derive(Default)]
-struct Aggregate<'a> { users: Vec<UserRow<'a>>, campaigns: Map<(u32,i32), CampaignRow> }
+struct Aggregate<'a> {
+    users: Vec<UserRow<'a>>,
+    campaigns: Vec<CampaignRow>,
+    first_day: i32,
+    days: usize,
+}
+impl<'a> Aggregate<'a> {
+    fn new(campaigns: usize, first_day: i32, days: usize) -> Self {
+        Self { users: Vec::new(), campaigns: vec![CampaignRow::default(); campaigns*days], first_day, days }
+    }
+    fn campaign(&mut self, campaign: u32, day: i32) -> &mut CampaignRow {
+        &mut self.campaigns[campaign as usize*self.days + (day-self.first_day) as usize]
+    }
+}
 
 fn top_category(totals: &[(u32,i64)], names: &[&[u8]]) -> Option<u32> {
     totals.iter().max_by(|a,b| a.1.cmp(&b.1).then_with(|| names[b.0 as usize].cmp(names[a.0 as usize]))).map(|v| v.0)
@@ -240,9 +254,9 @@ fn person<'a>(agg: &mut Aggregate<'a>, events: &[Event<'a>], clicks: &[Click<'_>
             left += 1;
         }
         let campaign = if left < right { clicks[right-1].campaign } else { 0 };
-        let credited = agg.campaigns.entry((campaign,day)).or_default();
+        let credited = agg.campaign(campaign, day);
         credited.sessions += 1; credited.purchasing += i64::from(revenue > 0); credited.revenue += revenue;
-        for &campaign in active.keys() { agg.campaigns.entry((campaign,day)).or_default().assists += 1; }
+        for &campaign in active.keys() { agg.campaign(campaign, day).assists += 1; }
         drop(phase);
         first = last;
     }
@@ -252,24 +266,23 @@ fn person<'a>(agg: &mut Aggregate<'a>, events: &[Event<'a>], clicks: &[Click<'_>
     }
 }
 
-fn output(path: &Path, mut agg: Aggregate<'_>, catalog: &Catalog<'_>) -> std::io::Result<()> {
-    let phase = Span::process(Phase::OutputSort);
-    agg.users.par_sort_unstable_by(|a,b| a.user.cmp(b.user).then(a.day.cmp(&b.day)));
-    drop(phase);
-    let rows = &agg.users;
-    parquet::write(&path.join("user_daily"), rows.len(), vec![
+fn output_users(path: &Path, part: usize, rows: &[UserRow<'_>], catalog: &Catalog<'_>) -> std::io::Result<()> {
+    let _phase = Span::worker(Phase::Parquet);
+    parquet::write(&path.join("user_daily"), part, rows.len(), vec![
         Column::string("user_id", false, rows.iter().map(|r| Some(r.user))),
         Column::date("day", rows.iter().map(|r| r.day)),
         Column::integer("sessions", rows.iter().map(|r| r.sessions)),
         Column::integer("events", rows.iter().map(|r| r.events)),
         Column::integer("revenue_cents", rows.iter().map(|r| r.revenue)),
         Column::string("top_category", true, rows.iter().map(|r| r.category.map(|c| catalog.categories[c as usize]))),
-    ])?;
-    let mut campaigns: Vec<_> = agg.campaigns.into_iter().collect();
-    let phase = Span::process(Phase::OutputSort);
-    campaigns.sort_unstable_by(|a,b| catalog.campaigns[a.0.0 as usize].0.cmp(catalog.campaigns[b.0.0 as usize].0).then(a.0.1.cmp(&b.0.1)));
-    drop(phase);
-    parquet::write(&path.join("campaign_daily"), campaigns.len(), vec![
+    ])
+}
+
+fn output_campaigns(path: &Path, agg: Aggregate<'_>, catalog: &Catalog<'_>) -> std::io::Result<()> {
+    let campaigns: Vec<_> = agg.campaigns.into_iter().enumerate()
+        .filter(|(_,row)| row.sessions != 0 || row.assists != 0)
+        .map(|(i,row)| (((i/agg.days) as u32, agg.first_day+(i%agg.days) as i32), row)).collect();
+    parquet::write(&path.join("campaign_daily"), 0, campaigns.len(), vec![
         Column::string("campaign_id", false, campaigns.iter().map(|r| Some(catalog.campaigns[r.0.0 as usize].0))),
         Column::string("channel", false, campaigns.iter().map(|r| Some(catalog.campaigns[r.0.0 as usize].1))),
         Column::date("day", campaigns.iter().map(|r| r.0.1)),
@@ -293,10 +306,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let phase = Span::process(Phase::Mmap);
     let data = Path::new(&data);
     let (start,end) = input::window(&data.join("manifest.json"))?;
+    let first_day = start.div_euclid(DAY) as i32;
+    let days = ((end-1).div_euclid(DAY)-i64::from(first_day)+1) as usize;
     let link_maps = map_dir(&data.join("links"))?;
-    drop(phase);
-    let phase = Span::process(Phase::Links);
-    let links = Links::new(&link_maps);
     drop(phase);
     let phase = Span::process(Phase::Mmap);
     let products = map_file(&data.join("products.csv"))?;
@@ -309,13 +321,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let event_maps = map_dir(&data.join("events"))?;
     let click_maps = map_dir(&data.join("clicks"))?;
     drop(phase);
-    let phase = Span::process(Phase::EventParse);
-    let parts: Vec<_> = chunks(&event_maps).par_iter().map(|bytes| parse_events(bytes, &links, &catalog, start, end)).collect();
-    drop(phase);
+    let (links, parts) = rayon::join(
+        || {
+            let _phase = Span::worker(Phase::Links);
+            Links::new(&link_maps)
+        },
+        || chunks(&event_maps).par_iter().map(|bytes| parse_events(bytes, &catalog, start, end)).collect::<Vec<_>>(),
+    );
     eprintln!("parse {:.3}s", clock.elapsed().as_secs_f64());
     let phase = Span::process(Phase::Dedup);
     let events = transpose(transpose(parts, DEDUP_BUCKETS).into_par_iter().map(|parts| {
-        partition(dedup(parts), |event| event.user_hash)
+        partition(dedup(parts, &links), |event| event.user_hash)
     }).collect(), USER_BUCKETS);
     drop(phase);
     eprintln!("dedup {:.3}s", clock.elapsed().as_secs_f64());
@@ -324,7 +340,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         partition(parse_clicks(bytes, &links, &catalog, start, end), |click| click.user_hash)
     }).collect(), USER_BUCKETS);
     drop(phase);
-    let agg = events.into_par_iter().zip(clicks).map(|(events, clicks)| {
+    let campaign_parts: Vec<_> = events.into_par_iter().zip(clicks).enumerate().map(|(part, (events, clicks))| {
         let phase = Span::worker(Phase::BucketCopy);
         let mut events = flatten(events);
         let mut clicks = flatten(clicks);
@@ -339,23 +355,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let phase = Span::worker(Phase::Grouping);
         let groups = work(&events, &clicks);
         drop(phase);
-        let mut agg = Aggregate::default();
+        let mut agg = Aggregate::new(catalog.campaigns.len(), first_day, days);
         let phase = Span::worker(Phase::PersonFused);
         for group in groups {
             person(&mut agg, &events[group.events], &clicks[group.clicks], &catalog.categories);
         }
         drop(phase);
-        agg
-    }).reduce(Aggregate::default, |mut a, b| {
+        output_users(Path::new(&out), part, &agg.users, &catalog)?;
+        Ok(agg.campaigns)
+    }).collect::<std::io::Result<Vec<_>>>()?;
+    let campaign_totals = campaign_parts.into_par_iter().reduce_with(|mut a, b| {
         let phase = Span::worker(Phase::CampaignMerge);
-        a.users.extend(b.users);
-        for (key, value) in b.campaigns { a.campaigns.entry(key).or_default().add(value); }
+        for (a,b) in a.iter_mut().zip(b) { a.add(b); }
         drop(phase);
         a
-    });
+    }).unwrap();
     eprintln!("aggregate {:.3}s", clock.elapsed().as_secs_f64());
     let phase = Span::process(Phase::Parquet);
-    output(Path::new(&out), agg, &catalog)?;
+    output_campaigns(Path::new(&out), Aggregate { users: Vec::new(), campaigns: campaign_totals, first_day, days }, &catalog)?;
     drop(phase);
     eprintln!("total {:.3}s", clock.elapsed().as_secs_f64());
     if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
@@ -381,7 +398,8 @@ mod tests {
     #[test]
     fn dedup_keeps_invalid_earliest_and_distinguishes_hash_collisions() {
         let make = |id, ingest, ts| RawEvent { id_hash: 7, id, user: b"u", ts, ingest, revenue: 0, category: 0 };
-        let result = dedup(vec![vec![make(&b"a"[..], 20, 100), make(&b"b"[..], 30, 200)], vec![make(&b"a"[..], 10, INVALID)]]);
+        let links = Links::new(&[]);
+        let result = dedup(vec![vec![make(&b"a"[..], 20, 100), make(&b"b"[..], 30, 200)], vec![make(&b"a"[..], 10, INVALID)]], &links);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].ts, 200);
     }
@@ -393,5 +411,13 @@ mod tests {
         assert_eq!(events.iter().map(|event| (event.user,event.ts)).collect::<Vec<_>>(), vec![
             (&b"a"[..], 20), (&b"a"[..], 30), (&b"b"[..], 10), (&b"b"[..], 25),
         ]);
+    }
+    #[test]
+    fn bad_ingest_drops_only_that_row() {
+        let catalog = Catalog::new(b"product_id,category\np,category\n", b"campaign_id,channel\n");
+        let rows = parse_events(b"bad,u,1,invalid,view,p,\ngood,u,2,1970-01-01T00:00:00Z,view,p,\n", &catalog, 0, DAY);
+        let kept: Vec<_> = rows.iter().flatten().collect();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].id, b"good");
     }
 }

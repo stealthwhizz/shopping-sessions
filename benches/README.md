@@ -4,13 +4,15 @@
 
 The implementation follows `rules.md`: links use union-find with minimum-byte names; mmap-backed CSV fields are borrowed, not allocated per row; events are hash-partitioned by event ID and deduplicated before invalid retained copies are discarded; valid events and clicks are partitioned by canonical person. Per-person timestamp ordering drives sessions, attribution, and a sliding seven-day campaign-count window. Hash collisions are checked against the actual bytes, including the numeric-sort fast path. Identical click copies need not be materialized as a separate dedup table: repeating an identical click cannot change the winning click or whether its campaign's count is zero in the attribution window.
 
-Outputs are deterministic, sorted before writing, scalar Parquet v1 with PLAIN/uncompressed pages, UTF-8 string annotations, DATE days, RLE definition levels for nullable categories, and losslessly selected INT32/INT64 columns. This deliberately narrow writer avoids Arrow, Thrift, compression libraries, and their startup/build costs. It rejects a data page over 2 GiB rather than emitting invalid Parquet.
+Outputs are deterministic scalar Parquet v1 with PLAIN/uncompressed pages, UTF-8 string annotations, DATE days, RLE definition levels for nullable categories, and losslessly selected INT32/INT64 columns. User rows are written by each of 32 fixed person partitions as it finishes; no global output sort or user-row merge is needed. Campaign totals use dense campaign-by-day arrays. This deliberately narrow writer avoids Arrow, Thrift, compression libraries, and their startup/build costs. It rejects a data page over 2 GiB rather than emitting invalid Parquet.
 
 ## Dependencies
 
 Direct, pinned: `memchr 2.7.6`, `memmap2 0.9.9`, `rayon 1.11.0`.
 
 `Cargo.lock` also pins `crossbeam-deque 0.8.8`, `crossbeam-epoch 0.9.21`, `crossbeam-utils 0.8.23`, `either 1.19.0`, `libc 0.2.191`, and `rayon-core 1.13.0`. No runtime Python or third-party shared libraries are needed; the Debian runtime supplies glibc.
+
+The measurements below through the phase breakdown describe the original committed round-one entry. See the round-two checkpoint at the end for the current source.
 
 ## Correctness commands
 
@@ -149,3 +151,19 @@ The default binary's measured interval from the logged final pipeline time to pr
 The two output files for this dataset are 70,047,291 and 1,120,867 bytes. The final native executable is 603,936 bytes; the final `shopping-rust` image is **78,555,248 bytes (74.92 MiB)**. A final `--no-cache` build took **18.19 s**, with base images already present and the host's build-only registry mirror injected by its Docker shim. No mirror is encoded in repository files.
 
 Raw phase measurements are retained under `out-rust20m-profile/phase-logs/`; they are generated, gitignored artifacts.
+
+## Round-two submission checkpoint
+
+The retained changes are dense campaign/day counters, partition-local unsorted user Parquet output, and overlapping union-find with event parsing. The kept event copy is resolved to its canonical person after dedup. A malformed `ingest_ts` now skips only that row rather than aborting the process; a regression test covers it.
+
+| Experiment | Native 20M median, CPUs 0-7 | Decision |
+|---|---:|---|
+| Original round one | 3.06 s | Baseline |
+| Dense campaign/day arrays | 3.03 s (3 runs) | Retained |
+| Partition-local unsorted output | 2.64 s (3 runs) | Retained |
+| Overlap links with parsing | 2.58 s initially; 2.49 s in later paired control runs | Retained |
+| Generic 16-byte inline IDs with a borrowed long-ID fallback | 4.59 s vs 2.49 s paired control | Completely reverted |
+
+The exact source/binary for the overlapped version is saved at `/tmp/rust-good-2/`; its copied binary passed 37/37 fixtures, official dev MATCH, and 12/12 crosscheck seeds including the 20M seed. Its binary SHA-256 is `347b177abb7732c3039026d35c9528336aedf4ef53cccc086181a2bcd8aa5e23`. The subsequent clean checkpoint adds only the malformed-ingest regression fix and is saved separately before further experiments.
+
+The inline-ID experiment was intentionally removed rather than hidden behind an unused option. Prefix-scatter and packed-u64 paths have not been introduced at this checkpoint. New experiments must start from a saved `/tmp/rust-good-N/` source plus paired binary, so a successful measured state can always be submitted independently of ongoing edits.
