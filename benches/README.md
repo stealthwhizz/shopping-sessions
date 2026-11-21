@@ -336,3 +336,41 @@ packed crosscheck 12/12; container 37/37 and dev MATCH. Scanner lab: 197 files,
 all **0 mismatches**. Image `shopping-rust-cp10`: **78,857,568 bytes**; measured
 dependency-cached image build **13.65 s** (Rust compile 8.04 s).
 
+## Checkpoint 11: indexed person groups and largest-first buckets
+
+RunLevel's three bucket commits are ported together: 128 person buckets, largest-first
+workers with private campaign totals, and exact local person indexing. Rows scatter
+directly from dedup parts into person groups, avoiding flatten-then-scatter copies.
+Only each person's rows are sorted; clicks from persons without events are discarded.
+The former bucket sort/merge helpers and their obsolete test are replaced, not retained.
+
+Five paired 20M runs improve checkpoint-ten best/median **0.88/0.88 s** to **0.79/0.80 s**.
+All five pairs improve. The independent five-run resource series is reproducible with:
+
+```sh
+python3 benches/measure.py /tmp/rust-good-11/shopping-sessions shopping-rust-cp11
+```
+
+| Dataset | Native best/median | Native peak KiB | Container best/median | Container peak KiB |
+|---|---:|---:|---:|---:|
+| dev, 1M | 0.0478/0.0485 s | 175,976 | 0.0472/0.0502 s | 176,364 |
+| s20m-2, 20M | 0.7786/0.7937 s | 2,816,036 | 0.7641/0.7940 s | 2,825,876 |
+
+The helper uses automatic path/layout, leaves outputs under a unique `out-measure-*`
+directory, reports process/container lifetimes separately from Docker-client overhead,
+and uses the scorer flags with 8 CPUs, CPU0-7 affinity, 12 GiB and allocator tunables.
+Linear 60M peak estimate: **8.09 GiB**; 60M was not run.
+
+Observed gates: 22 tests, 37/37 and dev MATCH compact/wide/string, native/container 20M MATCH,
+container 37/37 and dev MATCH, packed crosscheck 12/12. A separate native run with one
+thread and every dev part-file order reversed also MATCHed, using the two positional
+directory arguments. Image `shopping-rust-cp11`: **78,866,782 bytes**; dependency-cached
+build **14.55 s** (Rust compile 8.53 s).
+
+Five-run phase-profile medians (wall/CPU seconds) are links+parse envelope **0.319**
+(links CPU **0.288**, events CPU **2.214**), dedup **0.1665/1.2747**, clicks
+**0.0684/0.5249**, interleaved bucket envelope about **0.179** (sum CPU **1.295**),
+and teardown **0.0421/0.0418**. Bucket event-sort CPU is **0.3173**, click-sort
+**0.0952**, grouping **0.1407**, scatter **0.1805**, fused processing **0.4655**,
+and Parquet **0.0960**. These bucket envelopes overlap and must not be added.
+
