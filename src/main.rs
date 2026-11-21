@@ -25,7 +25,7 @@ const DEDUP_TASKS: usize = 128;
 const USER_BUCKETS: usize = 32;
 
 struct Catalog<'a> {
-    products: Map<&'a [u8], u32>,
+    products: Products<'a>,
     categories: Vec<&'a [u8]>,
     campaign_ids: Map<&'a [u8], u32>,
     campaigns: Vec<(&'a [u8], &'a [u8])>,
@@ -35,13 +35,13 @@ impl<'a> Catalog<'a> {
         let mut categories = vec![&b"unknown"[..]];
         let mut category_ids = Map::default();
         category_ids.insert(&b"unknown"[..], 0);
-        let mut product_map = Map::default();
+        let mut product_rows = Vec::new();
         for line in lines(body(products)) {
             let Some([product, category]) = csv::<2>(line) else { continue };
             let id = *category_ids.entry(category).or_insert_with(|| {
                 let id = categories.len() as u32; categories.push(category); id
             });
-            product_map.insert(product, id);
+            product_rows.push((product, id));
         }
         let mut campaign_ids = Map::default();
         let mut campaign_rows = vec![(&b"organic"[..], &b"organic"[..])];
@@ -50,7 +50,42 @@ impl<'a> Catalog<'a> {
             campaign_ids.insert(id, campaign_rows.len() as u32);
             campaign_rows.push((id, channel));
         }
-        Self { products: product_map, categories, campaign_ids, campaigns: campaign_rows }
+        Self { products: Products::new(&product_rows), categories, campaign_ids, campaigns: campaign_rows }
+    }
+}
+
+/// Product id -> category id (0, `unknown`, if absent); a later row for the same id wins.
+/// Packable ids sit in a flat linear-probing table of (packed id, category), so a purchase's
+/// lookup costs one cache miss instead of a hash-map probe plus a key comparison in the file.
+struct Products<'a> { slots: Vec<(u64, u32)>, other: Map<&'a [u8], u32> }
+impl<'a> Products<'a> {
+    fn new(rows: &[(&'a [u8], u32)]) -> Self {
+        let packable = rows.iter().filter(|row| keys::pack(row.0).is_some_and(|key| key != 0)).count();
+        let mut slots = vec![(0u64, 0u32); (packable*2).max(2).next_power_of_two()];
+        let mut other = Map::default();
+        for &(product, category) in rows {
+            // pack("") is 0, the empty-slot marker, so "" goes to `other` too.
+            match keys::pack(product) {
+                Some(key) if key != 0 => {
+                    let slot = Self::slot(&slots, key);
+                    slots[slot] = (key, category);
+                }
+                _ => { other.insert(product, category); }
+            }
+        }
+        Self { slots, other }
+    }
+    fn slot(slots: &[(u64, u32)], key: u64) -> usize {
+        let mask = slots.len()-1;
+        let mut slot = key.fingerprint() as usize & mask;
+        while slots[slot].0 != 0 && slots[slot].0 != key { slot = (slot+1) & mask; }
+        slot
+    }
+    fn get(&self, product: &[u8]) -> u32 {
+        match keys::pack(product) {
+            Some(key) if key != 0 => self.slots[Self::slot(&self.slots, key)].1,
+            _ => self.other.get(product).copied().unwrap_or(0),
+        }
     }
 }
 
@@ -98,7 +133,7 @@ fn parse_events<'a, K: Key<'a>, L: Layout>(bytes: &'a [u8], catalog: &Catalog<'_
                 b"purchase" => {
                     if let Some(p) = price(f[6]) {
                         revenue = p;
-                        category = catalog.products.get(f[5]).copied().unwrap_or(0);
+                        category = catalog.products.get(f[5]);
                     } else { ts = INVALID; }
                 }
                 _ => ts = INVALID,
@@ -510,6 +545,14 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn product_lookup_keeps_last_row_exact_ids_and_unknown() {
+        let catalog = Catalog::new(b"product_id,category\np1,a\np2,b\np1,c\n\"p 3\",d\n,e\nP1,f\nabcdefghijk,g\n", b"campaign_id,channel\n");
+        let name = |product: &[u8]| catalog.categories[catalog.products.get(product) as usize];
+        for (product, category) in [(&b"p1"[..], &b"c"[..]), (b"p2", b"b"), (b"p 3", b"d"), (b"", b"e"), (b"P1", b"f"), (b"abcdefghijk", b"g"), (b"p4", b"unknown"), (b"p10", b"unknown")] {
+            assert_eq!(name(product), category, "{product:?}");
+        }
+    }
     #[test]
     fn compact_record_widths_reduce_memory_traffic() {
         assert_eq!(std::mem::size_of::<RawEvent<u64,Compact>>(), 32);
