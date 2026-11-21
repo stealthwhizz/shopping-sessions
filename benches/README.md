@@ -393,3 +393,45 @@ wide/packed, and wide/string. A new differential test compares fused resolve/rou
 with the former separate passes, including linked and unlinked users, empty inputs,
 prefetch-boundary lengths, and all three key/layout combinations.
 
+### Retained prefetched-probe positions
+
+`Links::resolve_each` retains 16 prefetched lookup slots in a stack ring. Resolution
+starts at the saved slot instead of hashing the raw ID again. Its callback counts the
+canonical bucket in the same loop; only the dedup event path uses it. Click parsing and
+link construction are unchanged.
+
+Final interleaved runs (same four-thread/THP setup, medians of nine per binary):
+
+| Variant | Process wall | Dedup CPU (`phase-profile`) | Dedup wall |
+|---|---:|---:|---:|
+| Checkpoint 11 | 1.2621 s | 0.8946 s | 0.2327 s |
+| Fused resolution/counting | 1.2504 s | 0.8497 s | 0.2239 s |
+| Plus cached probe positions | 1.2472 s | 0.8269 s | 0.2167 s |
+
+The incremental default-build wall gain for the ring is small; the dedup CPU reduction
+is clearer. Combined gain is 1.2% process wall and 7.6% dedup CPU. Final observed gates:
+24 Rust tests; 37/37 fixtures and 20M MATCH in compact/packed, wide/packed, wide/string.
+Batch/scalar equivalence covers deliberately colliding keys, linked/unlinked/empty IDs,
+empty link tables, and lengths immediately around the prefetch boundaries.
+
+### Dedup cost attribution and rejected variants
+
+Seven interleaved stub-profile runs of checkpoint 11 measured about 0.955 CPU s for
+dedup plus resolution/routing. Removing resolution saves about 0.394 CPU s; removing
+partitioning saves 0.084-0.089 s. Gather/hash/vector work alone takes about 0.214 s
+(the raw-copy-specific increment is only about 0.037 s), valid-winner emission about
+0.090 s, exact suspects/table/emit about 0.048 s, and remaining bitmap/classification
+work about 0.126 s by subtraction. These are marginal estimates, not independent
+additive hardware counters: stubs alter memory allocation and the filter/table paths.
+
+| Experiment | Measured dedup CPU / decision |
+|---|---|
+| Bitmap over chunk slices; copy only suspects | 0.9746 vs 0.9430 s paired, rejected |
+| Prefetch distance 32/64/128 rather than 16 | No consistent wall/CPU win, rejected |
+| Reuse raw hash when canonical ID is unchanged | 0.8497 vs 0.8444 s, rejected |
+| Direct-mapped raw-to-canonical memo, 256/4096 slots | 0.8638/0.8777 vs 0.8497 s, rejected |
+| Interleaved two-bit saturated seen/repeated states | Neutral by process wall, rejected |
+
+Invalid retained events were already discarded before resolution at checkpoint 11.
+No validation, dedup identity, timestamp, parse routing, or person-bucket rules changed.
+

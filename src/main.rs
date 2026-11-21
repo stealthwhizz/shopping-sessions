@@ -268,14 +268,11 @@ fn dedup<'a, K: Key<'a>, L: Layout>(parts: &[Routed<K,L>], buckets: std::ops::Ra
 fn resolve_partition_events<'a, K: Key<'a>, L: Layout>(mut rows: Vec<Event<K,L>>, links: &Links<K>) -> Vec<Vec<Event<K,L>>> {
     let mut ids = Vec::with_capacity(rows.len());
     let mut counts = [0usize; USER_BUCKETS];
-    for i in 0..rows.len() {
-        if i+16 < rows.len() { links.prefetch(rows[i+16].user); }
-        let user = links.name(rows[i].user);
-        rows[i].user = user;
-        let bucket = (user.fingerprint() >> (64-USER_BITS)) as usize;
+    links.resolve_each(&mut rows, |row| &mut row.user, |row| {
+        let bucket = (row.user.fingerprint() >> (64-USER_BITS)) as usize;
         counts[bucket] += 1;
         ids.push(bucket as u8);
-    }
+    });
     let mut parts: Vec<Vec<_>> = counts.into_iter().map(Vec::with_capacity).collect();
     for (row, id) in rows.into_iter().zip(ids) { parts[id as usize].push(row); }
     parts
