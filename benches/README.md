@@ -401,3 +401,44 @@ packed crosscheck 12/12; one-thread reversed dev part-file order MATCH.
 Image `shopping-rust-cp12`: **78,865,761 bytes**; dependency-cached build **15.38 s**
 (Rust compile 9.60 s). The source and paired binary are in `/tmp/rust-good-12/`.
 
+### Rejected click count/scatter routing
+
+Reusing per-worker click scratch, routing into one contiguous vector with prefix offsets,
+and borrowing its bucket slices in `group()` passed 24 tests, 37/37 and dev MATCH in all
+three modes, and 20M MATCH. Five paired process runs measured **0.74/0.75 s** best/median
+for both baseline and candidate: two pairs faster, two slower, one tied. There was no
+end-to-end win, so the parser, generic routed wrapper, iterator API and new routing-only
+test were fully restored to checkpoint twelve.
+
+## Checkpoint 13: parallel mapped-page release before ordinary unmap
+
+After every pipeline and writer has completed, worker threads issue best-effort
+`MADV_DONTNEED` for input mappings, then the normal destructors unmap them. This clears
+page-table entries in parallel without skipping teardown or discarding the file cache.
+The mappings are shared/read-only; no mapped-byte borrows remain. Independent review
+found no lifetime issue and required ignoring advisory errors, which is implemented:
+a failed hint cannot turn fully written results into an unsuccessful process exit.
+
+Five rotating-order paired 20M runs improved native median **0.7859→0.7406 s** and
+container start-to-exit median **0.7741→0.7479 s**, every pair faster. The measured
+external-minus-body cleanup gap fell from roughly **38–43 ms to 12–14 ms**.
+Plain parallel `munmap` did not show a consistent cleanup improvement and was not retained.
+Only external process/container wall time, not the internal `total` timer, decides this.
+
+After the optional-hint error-handling correction, the separate five-run series measured:
+
+| Dataset | Native best/median | Native peak KiB | Container best/median | Container peak KiB |
+|---|---:|---:|---:|---:|
+| dev, 1M | 0.0443/0.0458 s | 175,508 | 0.0469/0.0487 s | 177,536 |
+| s20m-2, 20M | 0.7443/0.7735 s | 2,804,000 | 0.7528/0.7596 s | 2,829,052 |
+
+60M peak extrapolation: **8.10 GiB**, not a 60M measurement. The benefit may shrink on
+filesystems already mapping input through huge pages; correctness does not depend on
+the hint succeeding. The 0.30 s local target remains unmet.
+
+Observed corrected-source gates: 23 tests; 37/37 and dev MATCH compact/wide/string;
+native/container 20M MATCH; container 37/37 and dev MATCH; crosscheck 12/12;
+one-thread reversed dev file order MATCH. Image `shopping-rust-cp13`: **78,876,513 bytes**;
+dependency-cached build **15.25 s** (Rust compile 9.45 s). Frozen source and native binary:
+`/tmp/rust-good-13/`.
+

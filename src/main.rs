@@ -614,8 +614,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     {
         let phase = Span::process(Phase::Teardown);
-        drop(click_maps); drop(event_maps); drop(catalog); drop(campaigns);
-        drop(products); drop(link_maps);
+        drop(catalog); drop(campaigns); drop(products);
+        event_maps.par_iter().chain(&click_maps).chain(&link_maps).for_each(|map| {
+            // No mapped-byte borrows survive the completed pipeline; advice is optional.
+            let _ = unsafe { map.unchecked_advise(memmap2::UncheckedAdvice::DontNeed) };
+        });
+        drop(click_maps); drop(event_maps); drop(link_maps);
         drop(phase);
     }
     Ok(())
