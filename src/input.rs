@@ -231,6 +231,40 @@ impl<K> Links<K> {
             slot = (slot+1)&self.mask;
         }
     }
+
+    /// Resolve in input order, retaining the 16 prefetched slots so each raw ID is hashed once.
+    pub fn resolve_each<'a, T>(&self, rows: &mut [T], user: impl Fn(&mut T) -> &mut K, mut resolved: impl FnMut(&mut T)) where K: Key<'a> {
+        const AHEAD: usize = 16;
+        let prefetch = |slot: usize| {
+            #[cfg(target_arch = "x86_64")]
+            // The masked slot is inside the allocation; prefetch does not dereference it.
+            unsafe { std::arch::x86_64::_mm_prefetch(self.ids.as_ptr().add(slot).cast(), std::arch::x86_64::_MM_HINT_T0); }
+            #[cfg(not(target_arch = "x86_64"))]
+            let _ = slot;
+        };
+        let mut slots = [0usize;AHEAD];
+        for i in 0..rows.len().min(AHEAD) {
+            let slot = user(&mut rows[i]).fingerprint() as usize & self.mask;
+            slots[i] = slot;
+            prefetch(slot);
+        }
+        for i in 0..rows.len() {
+            let mut slot = slots[i%AHEAD];
+            if i+AHEAD < rows.len() {
+                let next = user(&mut rows[i+AHEAD]).fingerprint() as usize & self.mask;
+                slots[i%AHEAD] = next;
+                prefetch(next);
+            }
+            let id = user(&mut rows[i]);
+            loop {
+                let (key,name) = self.ids[slot];
+                if key == self.empty { break; }
+                if key == *id { *id = name; break; }
+                slot = (slot+1)&self.mask;
+            }
+            resolved(&mut rows[i]);
+        }
+    }
     #[inline]
     pub fn prefetch<'a>(&self, id: K) where K: Key<'a> {
         #[cfg(target_arch = "x86_64")]
@@ -249,6 +283,30 @@ mod tests {
         let mut map = memmap2::MmapMut::map_anon(bytes.len()).unwrap();
         map.copy_from_slice(bytes);
         map.make_read_only().unwrap()
+    }
+    #[test]
+    fn batched_resolve_matches_scalar_through_collisions_and_prefetch_tails() {
+        #[derive(Clone,Copy,Debug,Eq,PartialEq,Ord,PartialOrd,Hash)]
+        struct Collision(u64);
+        impl Key<'_> for Collision {
+            fn parse(bytes: &[u8]) -> Option<Self> { crate::keys::pack(bytes).map(Self) }
+            fn fingerprint(self) -> u64 { 7 }
+            fn append_plain(self, bytes: &mut Vec<u8>) { self.0.append_plain(bytes); }
+        }
+        impl LinkKey<'_> for Collision {}
+        let maps = [mapped(b"left,right\nq,a\nb,q\nc,b\nq,q\n")];
+        let keys: Vec<_> = [&b"q"[..], b"a", b"b", b"c", b"unlinked", b""].map(|name| Collision::parse(name).unwrap()).into();
+        for maps in [maps.as_slice(), &[]] {
+            let links = Links::<Collision>::new(maps, &AtomicBool::new(false));
+            for n in [0,1,15,16,17,31,32,33,63,64,65,257] {
+                let mut rows: Vec<_> = (0..n).map(|i| (keys[i%keys.len()],i)).collect();
+                let expected: Vec<_> = rows.iter().map(|&(id,payload)| (links.name(id),payload)).collect();
+                let mut visited = Vec::new();
+                links.resolve_each(&mut rows, |row| &mut row.0, |row| visited.push(*row));
+                assert_eq!(rows,expected,"length {n}");
+                assert_eq!(visited,expected,"callback order");
+            }
+        }
     }
     #[test]
     fn concurrent_links_match_exact_reference_across_thread_counts() {
