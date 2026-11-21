@@ -374,3 +374,30 @@ and teardown **0.0421/0.0418**. Bucket event-sort CPU is **0.3173**, click-sort
 **0.0952**, grouping **0.1407**, scatter **0.1805**, fused processing **0.4655**,
 and Parquet **0.0960**. These bucket envelopes overlap and must not be added.
 
+## Checkpoint 12: reusable dense active campaigns
+
+RunLevel's `Active` design replaces the per-person campaign-count hash map with worker-local
+counts, positions and an active list. Enter/leave are O(1); assists visit only present
+campaigns. Clearing between persons preserves the previous seven-day window semantics.
+A new 20K-operation reference test covers counts, swap removals and repeated clears.
+
+The first five paired runs measured checkpoint-eleven/twelve medians **0.80/0.79 s**.
+A second seven-pair series measured best/median **0.78/0.79 s** versus **0.77/0.78 s**,
+five faster pairs and two ties at the external timer's 10 ms precision, none slower.
+Fused processing CPU measured **0.377 s** versus the earlier **0.466 s** profile.
+Other phases were slower in that later profile, so only paired wall comparisons decide
+the keep; cross-series absolute clocks are not treated as an improvement.
+
+The subsequent independent five-run resource series was noisier/slower overall:
+
+| Dataset | Native best/median | Native peak KiB | Container best/median | Container peak KiB |
+|---|---:|---:|---:|---:|
+| dev, 1M | 0.0488/0.0531 s | 175,780 | 0.0484/0.0538 s | 177,024 |
+| s20m-2, 20M | 0.8761/0.8946 s | 2,812,724 | 0.8709/0.8919 s | 2,826,008 |
+
+Linear 60M peak estimate remains **8.09 GiB**. Observed gates: 23 tests; 37/37 and dev
+MATCH compact/wide/string; native/container 20M MATCH; container 37/37 and dev MATCH;
+packed crosscheck 12/12; one-thread reversed dev part-file order MATCH.
+Image `shopping-rust-cp12`: **78,865,761 bytes**; dependency-cached build **15.38 s**
+(Rust compile 9.60 s). The source and paired binary are in `/tmp/rust-good-12/`.
+

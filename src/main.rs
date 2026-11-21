@@ -378,8 +378,32 @@ fn top_category(totals: &[(u32,i64)], names: &[&[u8]]) -> Option<u32> {
     totals.iter().max_by(|a,b| a.1.cmp(&b.1).then_with(|| names[b.0 as usize].cmp(names[a.0 as usize]))).map(|v| v.0)
 }
 
-fn person<K: Copy+Ord, L: Layout>(agg: &mut Aggregate<K>, events: &[Event<K,L>], clicks: &[Click<K,L>], categories: &[&[u8]], origin: i64) {
-    let mut active = Map::<u32,u32>::default();
+/// Dense sliding-window campaign counts, with O(1) removal and no hash-table scans.
+struct Active { count: Vec<u32>, pos: Vec<u32>, list: Vec<u32> }
+impl Active {
+    fn new(campaigns: usize) -> Self { Self { count: vec![0; campaigns], pos: vec![0; campaigns], list: Vec::new() } }
+    #[inline]
+    fn add(&mut self, campaign: u32) {
+        let c = campaign as usize;
+        if self.count[c] == 0 { self.pos[c] = self.list.len() as u32; self.list.push(campaign); }
+        self.count[c] += 1;
+    }
+    #[inline]
+    fn remove(&mut self, campaign: u32) {
+        let c = campaign as usize;
+        self.count[c] -= 1;
+        if self.count[c] == 0 {
+            let last = self.list.pop().unwrap();
+            if last != campaign { let p = self.pos[c]; self.list[p as usize] = last; self.pos[last as usize] = p; }
+        }
+    }
+    fn clear(&mut self) {
+        for &c in &self.list { self.count[c as usize] = 0; }
+        self.list.clear();
+    }
+}
+
+fn person<K: Copy+Ord, L: Layout>(agg: &mut Aggregate<K>, active: &mut Active, events: &[Event<K,L>], clicks: &[Click<K,L>], categories: &[&[u8]], origin: i64) {
     let (mut left, mut right, mut first) = (0,0,0);
     let mut daily: Option<UserRow<K>> = None;
     let mut category_totals = Vec::<(u32,i64)>::new();
@@ -413,19 +437,17 @@ fn person<K: Copy+Ord, L: Layout>(agg: &mut Aggregate<K>, events: &[Event<K,L>],
         drop(phase);
         let phase = Span::sampled(Phase::AttributionSample, sampled);
         while right < clicks.len() && L::units(clicks[right].ts) <= start {
-            *active.entry(clicks[right].campaign).or_default() += 1;
+            active.add(clicks[right].campaign);
             right += 1;
         }
         while left < right && L::units(clicks[left].ts) < start-WEEK {
-            let campaign = clicks[left].campaign;
-            let count = active.get_mut(&campaign).unwrap(); *count -= 1;
-            if *count == 0 { active.remove(&campaign); }
+            active.remove(clicks[left].campaign);
             left += 1;
         }
         let campaign = if left < right { clicks[right-1].campaign } else { 0 };
         let credited = agg.campaign(campaign, day);
         credited.sessions += 1; credited.purchasing += i64::from(revenue > 0); credited.revenue += revenue;
-        for &campaign in active.keys() { agg.campaign(campaign, day).assists += 1; }
+        for &campaign in &active.list { agg.campaign(campaign, day).assists += 1; }
         drop(phase);
         first = last;
     }
@@ -433,6 +455,7 @@ fn person<K: Copy+Ord, L: Layout>(agg: &mut Aggregate<K>, events: &[Event<K,L>],
     if let Some(mut row) = daily {
         row.category = top_category(&category_totals, categories); agg.users.push(row);
     }
+    active.clear();
 }
 
 fn output_users<'a, K: Key<'a>>(path: &Path, part: usize, rows: &[UserRow<K>], catalog: &Catalog<'_>) -> std::io::Result<()> {
@@ -502,6 +525,7 @@ fn pipeline<'a, K: LinkKey<'a>, L: Layout>(link_maps: &'a [Mmap], event_maps: &'
     let campaign_parts = (0..rayon::current_num_threads()).into_par_iter().map(|_| {
         let mut agg = Aggregate::new(catalog.campaigns.len(), first_day, days);
         let mut grouper = Grouper::default();
+        let mut active = Active::new(catalog.campaigns.len());
         while let Some(&part) = order.get(next.fetch_add(1, Relaxed)) {
             let (events, clicks) = tasks[part].lock().unwrap().take().unwrap();
             let grouped = group(&mut grouper, events, clicks);
@@ -509,7 +533,7 @@ fn pipeline<'a, K: LinkKey<'a>, L: Layout>(link_maps: &'a [Mmap], event_maps: &'
             agg.users.clear();
             for p in 0..grouped.event_starts.len()-1 {
                 let (events, clicks) = (grouped.event_starts[p] as usize..grouped.event_starts[p+1] as usize, grouped.click_starts[p] as usize..grouped.click_starts[p+1] as usize);
-                person(&mut agg, &grouped.events[events], &grouped.clicks[clicks], &catalog.categories, origin);
+                person(&mut agg, &mut active, &grouped.events[events], &grouped.clicks[clicks], &catalog.categories, origin);
             }
             drop(phase);
             output_users(out, part, &agg.users, catalog)?;
@@ -605,6 +629,34 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn active_campaigns_match_reference_through_swaps_and_person_resets() {
+        let mut active = Active::new(37);
+        let mut expected = [0u32;37];
+        let mut state = 3u64;
+        for step in 0..20_000 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let campaign = (state >> 32) as usize % expected.len();
+            if step % 251 == 0 {
+                active.clear(); expected.fill(0);
+            } else if state & 1 != 0 && expected[campaign] > 0 {
+                active.remove(campaign as u32); expected[campaign] -= 1;
+            } else {
+                active.add(campaign as u32); expected[campaign] += 1;
+            }
+            let mut present = [false;37];
+            for (position, &campaign) in active.list.iter().enumerate() {
+                let campaign = campaign as usize;
+                assert!(!present[campaign]);
+                present[campaign] = true;
+                assert_eq!(active.pos[campaign] as usize,position);
+            }
+            for campaign in 0..expected.len() {
+                assert_eq!(active.count[campaign],expected[campaign]);
+                assert_eq!(present[campaign],expected[campaign] > 0);
+            }
+        }
+    }
     #[test]
     fn product_lookup_keeps_last_row_exact_ids_and_unknown() {
         let catalog = Catalog::new(b"product_id,category\np1,a\np2,b\np1,c\n\"p 3\",d\n,e\nP1,f\nabcdefghijk,g\n", b"campaign_id,channel\n");
