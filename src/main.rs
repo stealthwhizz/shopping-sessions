@@ -66,6 +66,7 @@ struct RawEvent<K, L: Layout> {
 }
 #[derive(Clone, Copy)]
 struct Event<K, L: Layout> { user: K, data: L::Data }
+#[derive(Clone, Copy)]
 struct Click<K, L: Layout> { user: K, id: K, ts: L::Time, campaign: u32 }
 
 /// One chunk's raw event copies grouped by dedup bucket: bucket `b` is `rows[starts[b]..starts[b+1]]`.
@@ -155,17 +156,6 @@ fn resolve<'a, K: Key<'a>, T>(rows: &mut [T], links: &Links<K>, user: impl Fn(&m
     }
 }
 
-
-fn sort_events<K: Copy+Ord, L: Layout>(events: &mut [Event<K,L>]) {
-    events.sort_unstable_by_key(|event| (event.user, L::time(event.data)));
-}
-
-fn flatten<T>(parts: Vec<Vec<T>>) -> Vec<T> {
-    let mut all = Vec::with_capacity(parts.iter().map(Vec::len).sum());
-    for mut part in parts { all.append(&mut part); }
-    all
-}
-
 fn partition<T>(rows: Vec<T>, key: impl Fn(&T) -> u64) -> Vec<Vec<T>> {
     let mut counts = [0; USER_BUCKETS];
     for row in &rows { counts[(key(row) >> (64-USER_BITS)) as usize] += 1; }
@@ -239,20 +229,100 @@ fn dedup<'a, K: Key<'a>, L: Layout>(parts: &[Routed<K,L>], buckets: std::ops::Ra
     events
 }
 
-struct Work { events: std::ops::Range<usize>, clicks: std::ops::Range<usize> }
-fn work<K: Copy+Ord, L: Layout>(events: &[Event<K,L>], clicks: &[Click<K,L>]) -> Vec<Work> {
-    let mut result = Vec::new();
-    let (mut e, mut c) = (0,0);
-    while e < events.len() {
-        let start = e;
-        let person = &events[e];
-        while e < events.len() && events[e].user == person.user { e += 1; }
-        while c < clicks.len() && clicks[c].user < person.user { c += 1; }
-        let first = c;
-        while c < clicks.len() && clicks[c].user == person.user { c += 1; }
-        result.push(Work { events: start..e, clicks: first..c });
+/// Dense per-bucket person index: an open-addressing table of indexes into `users`.
+struct Grouper<K> { slots: Vec<u32>, users: Vec<K>, ids: Vec<u32> }
+impl<K> Default for Grouper<K> {
+    fn default() -> Self { Self { slots: Vec::new(), users: Vec::new(), ids: Vec::new() } }
+}
+
+/// `Ok(person index)` of `user`, or `Err(empty slot)` where it would go.
+fn find_person<'a, K: Key<'a>>(slots: &[u32], users: &[K], user: K) -> Result<u32, usize> {
+    let mask = slots.len()-1;
+    let mut slot = user.fingerprint() as usize & mask;
+    loop {
+        match slots[slot] {
+            u32::MAX => return Err(slot),
+            i if users[i as usize] == user => return Ok(i),
+            _ => slot = (slot+1) & mask,
+        }
     }
-    result
+}
+
+/// Copies `rows` into one vector ordered by person (`ids[i]` is row i's person, u32::MAX drops
+/// it) and returns it with each person's start offset (`persons+1` entries).
+fn scatter_by_person<'r, T: Copy + 'r>(rows: impl Iterator<Item=&'r T>, ids: &[u32], persons: usize) -> (Vec<T>, Vec<u32>) {
+    let mut starts = vec![0u32; persons+1];
+    for &i in ids { if i != u32::MAX { starts[i as usize+1] += 1; } }
+    for p in 0..persons { starts[p+1] += starts[p]; }
+    let total = starts[persons] as usize;
+    let mut cursor = starts[..persons].to_vec();
+    let mut out = Vec::<T>::with_capacity(total);
+    let dst = out.as_mut_ptr();
+    for (row, &i) in rows.zip(ids) {
+        if i == u32::MAX { continue; }
+        let slot = &mut cursor[i as usize];
+        // SAFETY: cursors start at the prefix sums of the exact per-person counts, so each index
+        // in 0..total is written exactly once before set_len.
+        unsafe { dst.add(*slot as usize).write(*row); }
+        *slot += 1;
+    }
+    unsafe { out.set_len(total); }
+    (out, starts)
+}
+
+/// One bucket's rows grouped by exact person: person p's events are
+/// `events[event_starts[p]..event_starts[p+1]]` sorted by ts, and its clicks likewise sorted by
+/// ts, then click ID descending (so within equal timestamps the smallest ID is last and wins).
+struct Grouped<K, L: Layout> { events: Vec<Event<K,L>>, clicks: Vec<Click<K,L>>, event_starts: Vec<u32>, click_starts: Vec<u32> }
+
+/// Groups without sorting the whole bucket: each distinct user gets a dense index, rows are
+/// counted and scattered per person, and only each person's few rows are sorted. Clicks of users
+/// with no event in the bucket are dropped; they cannot credit a session.
+fn group<'a, K: Key<'a>, L: Layout>(g: &mut Grouper<K>, events: Vec<Vec<Event<K,L>>>, clicks: Vec<Vec<Click<K,L>>>) -> Grouped<K,L> {
+    let phase = Span::worker(Phase::Grouping);
+    let n: usize = events.iter().map(Vec::len).sum();
+    let Grouper { slots, users, ids } = g;
+    slots.clear(); slots.resize((n/8).max(64).next_power_of_two(), u32::MAX);
+    users.clear(); ids.clear();
+    for event in events.iter().flatten() {
+        let i = match find_person(slots, users, event.user) {
+            Ok(i) => i,
+            Err(slot) => {
+                let i = users.len() as u32;
+                users.push(event.user);
+                slots[slot] = i;
+                if users.len()*2 > slots.len() {
+                    let size = slots.len()*2;
+                    slots.clear(); slots.resize(size, u32::MAX);
+                    for (i, &user) in users.iter().enumerate() {
+                        let slot = find_person(slots, users, user).unwrap_err();
+                        slots[slot] = i as u32;
+                    }
+                }
+                i
+            }
+        };
+        ids.push(i);
+    }
+    ids.extend(clicks.iter().flatten().map(|click| find_person(slots, users, click.user).unwrap_or(u32::MAX)));
+    drop(phase);
+    let phase = Span::worker(Phase::BucketCopy);
+    let event_count = n;
+    let (mut grouped_events, event_starts) = scatter_by_person(events.iter().flatten(), &ids[..event_count], users.len());
+    let (mut grouped_clicks, click_starts) = scatter_by_person(clicks.iter().flatten(), &ids[event_count..], users.len());
+    drop((events, clicks));
+    drop(phase);
+    let phase = Span::worker(Phase::EventSort);
+    for p in event_starts.windows(2) {
+        grouped_events[p[0] as usize..p[1] as usize].sort_unstable_by_key(|event| L::time(event.data));
+    }
+    drop(phase);
+    let phase = Span::worker(Phase::ClickSort);
+    for p in click_starts.windows(2) {
+        grouped_clicks[p[0] as usize..p[1] as usize].sort_unstable_by(|a,b| a.ts.cmp(&b.ts).then_with(|| b.id.cmp(&a.id)));
+    }
+    drop(phase);
+    Grouped { events: grouped_events, clicks: grouped_clicks, event_starts, click_starts }
 }
 
 struct UserRow<K> { user: K, day: i32, sessions: i64, events: i64, revenue: i64, category: Option<u32> }
@@ -410,26 +480,15 @@ fn pipeline<'a, K: Key<'a>, L: Layout>(link_maps: &'a [Mmap], event_maps: &'a [M
     let next = std::sync::atomic::AtomicUsize::new(0);
     let campaign_parts = (0..rayon::current_num_threads()).into_par_iter().map(|_| {
         let mut agg = Aggregate::new(catalog.campaigns.len(), first_day, days);
+        let mut grouper = Grouper::default();
         while let Some(&part) = order.get(next.fetch_add(1, Relaxed)) {
             let (events, clicks) = tasks[part].lock().unwrap().take().unwrap();
-            let phase = Span::worker(Phase::BucketCopy);
-            let mut events = flatten(events);
-            let mut clicks = flatten(clicks);
-            drop(phase);
-            let phase = Span::worker(Phase::EventSort);
-            sort_events(&mut events);
-            drop(phase);
-            let phase = Span::worker(Phase::ClickSort);
-            // Within equal timestamps the smallest click ID is last, hence right-1 wins.
-            clicks.sort_unstable_by(|a,b| a.user.cmp(&b.user).then(a.ts.cmp(&b.ts)).then_with(|| b.id.cmp(&a.id)));
-            drop(phase);
-            let phase = Span::worker(Phase::Grouping);
-            let groups = work(&events, &clicks);
-            drop(phase);
+            let grouped = group(&mut grouper, events, clicks);
             let phase = Span::worker(Phase::PersonFused);
             agg.users.clear();
-            for group in groups {
-                person(&mut agg, &events[group.events], &clicks[group.clicks], &catalog.categories, origin);
+            for p in 0..grouped.event_starts.len()-1 {
+                let (events, clicks) = (grouped.event_starts[p] as usize..grouped.event_starts[p+1] as usize, grouped.click_starts[p] as usize..grouped.click_starts[p+1] as usize);
+                person(&mut agg, &grouped.events[events], &grouped.clicks[clicks], &catalog.categories, origin);
             }
             drop(phase);
             output_users(out, part, &agg.users, catalog)?;
@@ -580,13 +639,43 @@ mod tests {
         assert_eq!(kept, reference);
     }
     #[test]
-    fn event_sort_uses_exact_person_key_before_timestamp() {
-        let make = |user, ts| Event::<_,Wide> { user, data: Wide::event(ts, 0, 0, 0) };
-        let mut events = vec![make(2u64, 10), make(1, 30), make(1, 20), make(2, 25)];
-        sort_events(&mut events);
-        assert_eq!(events.iter().map(|event| (event.user,Wide::time(event.data))).collect::<Vec<_>>(), vec![
-            (1, 20), (1, 30), (2, 10), (2, 25),
-        ]);
+    fn grouping_keeps_exact_persons_time_order_and_click_tie_break() {
+        #[derive(Clone,Copy,Debug,Eq,PartialEq,Ord,PartialOrd,Hash)]
+        struct Collision(u64);
+        impl Key<'_> for Collision {
+            fn parse(bytes: &[u8]) -> Option<Self> { crate::keys::pack(bytes).map(Self) }
+            fn fingerprint(self) -> u64 { self.0 % 3 }
+            fn append_plain(self, bytes: &mut Vec<u8>) { self.0.append_plain(bytes); }
+        }
+        // 300 users with colliding fingerprints force probing and several table growths.
+        let event = |user: u64, ts| Event::<_,Wide> { user: Collision(user), data: Wide::event(ts, 0, 0, 0) };
+        let click = |user: u64, id: u64, ts| Click::<_,Wide> { user: Collision(user), id: Collision(id), ts, campaign: id as u32 };
+        let mut state = 9u64;
+        let mut next = |n: u64| { state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (state >> 33) % n };
+        let events: Vec<Vec<_>> = (0..4).map(|_| (0..500).map(|_| event(next(300), next(50) as i64)).collect()).collect();
+        let clicks: Vec<Vec<_>> = (0..3).map(|_| (0..400).map(|_| click(next(400), next(20), next(50) as i64)).collect()).collect();
+        let mut expected_events: Vec<_> = events.iter().flatten().map(|e| (e.user, Wide::time(e.data))).collect();
+        let users: std::collections::BTreeSet<_> = expected_events.iter().map(|e| e.0).collect();
+        let mut expected_clicks: Vec<_> = clicks.iter().flatten().filter(|c| users.contains(&c.user)).map(|c| (c.user, c.ts, std::cmp::Reverse(c.id))).collect();
+        let mut grouper = Grouper::default();
+        let grouped = group(&mut grouper, events, clicks);
+        let persons = grouped.event_starts.len()-1;
+        assert_eq!(persons, users.len());
+        let (mut actual_events, mut actual_clicks) = (Vec::new(), Vec::new());
+        for p in 0..persons {
+            let rows = &grouped.events[grouped.event_starts[p] as usize..grouped.event_starts[p+1] as usize];
+            let person = rows[0].user;
+            assert!(rows.windows(2).all(|w| w[0].user == person && w[1].user == person && Wide::time(w[0].data) <= Wide::time(w[1].data)));
+            actual_events.extend(rows.iter().map(|e| (e.user, Wide::time(e.data))));
+            let rows = &grouped.clicks[grouped.click_starts[p] as usize..grouped.click_starts[p+1] as usize];
+            assert!(rows.iter().all(|c| c.user == person));
+            assert!(rows.windows(2).all(|w| (w[0].ts, std::cmp::Reverse(w[0].id)) <= (w[1].ts, std::cmp::Reverse(w[1].id))));
+            actual_clicks.extend(rows.iter().map(|c| (c.user, c.ts, std::cmp::Reverse(c.id))));
+        }
+        expected_events.sort_unstable(); actual_events.sort_unstable();
+        expected_clicks.sort_unstable(); actual_clicks.sort_unstable();
+        assert_eq!(actual_events, expected_events);
+        assert_eq!(actual_clicks, expected_clicks);
     }
     #[test]
     fn bad_ingest_drops_only_that_row() {
