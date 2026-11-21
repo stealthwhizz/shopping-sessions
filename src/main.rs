@@ -171,32 +171,52 @@ fn transpose<T>(parts: Vec<Vec<Vec<T>>>, count: usize) -> Vec<Vec<Vec<T>>> {
     buckets
 }
 
-struct DedupScratch<K, L: Layout> { rows: Vec<RawEvent<K,L>>, hashes: Vec<u32>, table: Vec<u32> }
+struct DedupScratch<K, L: Layout> { rows: Vec<RawEvent<K,L>>, hashes: Vec<u32>, seen: Vec<u64>, repeated: Vec<u64>, suspects: Vec<u32>, table: Vec<u32> }
 impl<K, L: Layout> Default for DedupScratch<K,L> {
-    fn default() -> Self { Self { rows: Vec::new(), hashes: Vec::new(), table: Vec::new() } }
+    fn default() -> Self { Self { rows: Vec::new(), hashes: Vec::new(), seen: Vec::new(), repeated: Vec::new(), suspects: Vec::new(), table: Vec::new() } }
 }
 
 /// Dedups each bucket in `buckets` across every chunk's copies. A bucket's rows are gathered
-/// into `s` (L2-sized), and an index table keeps the copy with the smallest ingest_ts.
+/// into `s` (L2-sized) while a bitmap of 16 bits per row marks hash bits seen more than once.
+/// A row whose bit was seen once is the only copy of its event_id and is kept directly; only
+/// the suspects (true duplicates plus ~6% bit collisions) go through the exact index table
+/// that keeps the copy with the smallest ingest_ts.
 fn dedup<'a, K: Key<'a>, L: Layout>(parts: &[Routed<K,L>], buckets: std::ops::Range<usize>, links: &Links<K>, s: &mut DedupScratch<K,L>) -> Vec<Event<K,L>> {
     let count: usize = parts.iter().map(|p| (p.starts[buckets.end]-p.starts[buckets.start]) as usize).sum();
     let mut events = Vec::with_capacity(count);
     let mut emit = |row: &RawEvent<K,L>| if L::valid(row.data) { events.push(Event { user: links.name(row.user), data: row.data }) };
     for b in buckets {
-        s.rows.clear(); s.hashes.clear();
+        s.rows.clear(); s.hashes.clear(); s.suspects.clear();
+        let n: usize = parts.iter().map(|p| p.bucket(b).len()).sum();
+        let mask = (n*16).max(64).next_power_of_two()-1;
+        s.seen.clear(); s.seen.resize((mask+1)/64, 0);
+        s.repeated.clear(); s.repeated.resize((mask+1)/64, 0);
         for part in parts {
-            for row in part.bucket(b) { s.rows.push(*row); s.hashes.push(row.id.fingerprint() as u32); }
+            for row in part.bucket(b) {
+                let hash = row.id.fingerprint() as u32;
+                let bit = hash as usize & mask;
+                let (word, flag) = (bit >> 6, 1u64 << (bit & 63));
+                s.repeated[word] |= s.seen[word] & flag;
+                s.seen[word] |= flag;
+                s.rows.push(*row); s.hashes.push(hash);
+            }
         }
-        let capacity = (s.rows.len()*2).max(2).next_power_of_two();
-        s.table.clear(); s.table.resize(capacity, u32::MAX);
         for (i, (row, &hash)) in s.rows.iter().zip(&s.hashes).enumerate() {
-            let mut slot = hash as usize & (capacity-1);
+            let bit = hash as usize & mask;
+            if s.repeated[bit >> 6] & (1 << (bit & 63)) == 0 { emit(row); } else { s.suspects.push(i as u32); }
+        }
+        let capacity = (s.suspects.len()*2).max(2).next_power_of_two();
+        s.table.clear(); s.table.resize(capacity, u32::MAX);
+        for &i in &s.suspects {
+            let (row, hash) = (&s.rows[i as usize], s.hashes[i as usize]);
+            // High hash bits: suspects share their low (bitmap) bits with their colliders.
+            let mut slot = hash.rotate_left(13) as usize & (capacity-1);
             loop {
                 let old = s.table[slot];
-                if old == u32::MAX { s.table[slot] = i as u32; break; }
+                if old == u32::MAX { s.table[slot] = i; break; }
                 let kept = &s.rows[old as usize];
                 if s.hashes[old as usize] == hash && kept.id == row.id {
-                    if row.ingest < kept.ingest { s.table[slot] = i as u32; }
+                    if row.ingest < kept.ingest { s.table[slot] = i; }
                     break;
                 }
                 slot = (slot+1) & (capacity-1);
