@@ -2,8 +2,10 @@ mod input;
 mod parquet;
 mod profile;
 mod keys;
+mod scan;
 
-use input::{DAY, WEEK, Links, Map, body, chunks, csv, lines, map_dir, map_file, price, timestamp};
+use input::{DAY, WEEK, Links, Map, body, chunks, csv, lines, map_dir, map_file, price};
+use scan::timestamp;
 use parquet::Column;
 use profile::{Phase, Span};
 use keys::Key;
@@ -60,13 +62,13 @@ struct Click<K> { user: K, id: K, ts: i64, campaign: u32 }
 fn parse_events<'a, K: Key<'a>>(bytes: &'a [u8], catalog: &Catalog<'_>, start: i64, end: i64, unsupported: &AtomicBool) -> Vec<Vec<RawEvent<K>>> {
     let _phase = Span::worker(Phase::EventParse);
     let mut rows: Vec<Vec<_>> = (0..DEDUP_BUCKETS).map(|_| Vec::with_capacity(bytes.len()/70/DEDUP_BUCKETS)).collect();
-    for line in lines(bytes) {
-        let Some(f) = csv::<7>(line) else { continue };
-        if f[0].is_empty() { continue; }
+    scan::for_each_line::<7>(bytes, |f| {
+        let Some(f) = f else { return };
+        if f[0].is_empty() { return; }
         let (Some(id),Some(user)) = (K::parse(f[0]),K::parse(f[1])) else {
-            unsupported.store(true, Relaxed); continue;
+            unsupported.store(true, Relaxed); return;
         };
-        let Some(ingest) = timestamp(f[3]) else { continue };
+        let Some(ingest) = timestamp(f[3]) else { return };
         let mut ts = timestamp(f[2]).unwrap_or(INVALID);
         let mut revenue = 0;
         let mut category = 0;
@@ -88,25 +90,25 @@ fn parse_events<'a, K: Key<'a>>(bytes: &'a [u8], catalog: &Catalog<'_>, start: i
         // Invalid earliest copies remain in dedup, so a later valid row cannot rescue them.
         let id_hash = id.fingerprint();
         rows[(id_hash >> 57) as usize].push(RawEvent { id, user, ts, ingest, revenue, category });
-    }
+    });
     rows
 }
 
 fn parse_clicks<'a, K: Key<'a>>(bytes: &'a [u8], links: &Links<K>, catalog: &Catalog<'_>, start: i64, end: i64, unsupported: &AtomicBool) -> Vec<Click<K>> {
     let mut rows = Vec::with_capacity(bytes.len()/45);
-    for line in lines(bytes) {
-        let Some([id,user,campaign,ts]) = csv::<4>(line) else { continue };
-        if id.is_empty() || user.is_empty() { continue; }
+    scan::for_each_line::<4>(bytes, |f| {
+        let Some([id,user,campaign,ts]) = f else { return };
+        if id.is_empty() || user.is_empty() { return; }
         let (Some(id),Some(user)) = (K::parse(id),K::parse(user)) else {
-            unsupported.store(true, Relaxed); continue;
+            unsupported.store(true, Relaxed); return;
         };
-        let Some(ts) = timestamp(ts).filter(|&ts| ts >= start-WEEK && ts < end) else { continue };
-        let Some(&campaign) = catalog.campaign_ids.get(campaign) else { continue };
+        let Some(ts) = timestamp(ts).filter(|&ts| ts >= start-WEEK && ts < end) else { return };
+        let Some(&campaign) = catalog.campaign_ids.get(campaign) else { return };
         let user = links.name(user);
         // Click duplicates have identical values: repeating one changes neither the
         // winning click nor the per-campaign sliding-window counts' zero/nonzero state.
         rows.push(Click { user, id, ts, campaign });
-    }
+    });
     rows
 }
 

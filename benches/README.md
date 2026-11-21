@@ -12,7 +12,7 @@ Direct, pinned: `memchr 2.7.6`, `memmap2 0.9.9`, `rayon 1.11.0`.
 
 `Cargo.lock` also pins `crossbeam-deque 0.8.8`, `crossbeam-epoch 0.9.21`, `crossbeam-utils 0.8.23`, `either 1.19.0`, `libc 0.2.191`, and `rayon-core 1.13.0`. No runtime Python or third-party shared libraries are needed; the Debian runtime supplies glibc.
 
-The measurements below through the phase breakdown describe the original committed round-one entry. See the round-two checkpoint at the end for the current source.
+The measurements through the first phase breakdown describe the original round-one entry. Current checkpoint measurements and verification are recorded at the end.
 
 ## Correctness commands
 
@@ -55,7 +55,7 @@ Times below are back-to-back native runs, not comparisons across changing therma
 
 The initial global-sort implementation took 5.89 s / 4,135,728 KiB on 20M before CPU isolation; that figure is context, not a controlled comparison with the final implementation.
 
-## Final native measurements
+## Round-one native measurements
 
 Five warm-cache runs, `taskset -c 0-7`, `NCPU=8`; RSS is the maximum observed across the five runs.
 
@@ -64,11 +64,11 @@ Five warm-cache runs, `taskset -c 0-7`, `NCPU=8`; RSS is the maximum observed ac
 | dev, 1M events | 0.11 s | 0.11 s | 216,428 KiB (211 MiB) |
 | s20m-2, 20M events | 3.05 s | 3.06 s | 4,308,092 KiB (4.11 GiB) |
 
-The current binary passes all six Rust unit tests, all 37 fixtures, and the official dev comparison. Reversing all input part-file names and running with one worker produces byte-identical Parquet to the normal eight-worker run. An argv-only three-worker run is byte-identical too. A header-only dataset produces both zero-row tables with exactly the required columns and a DATE `day`.
+The round-one binary passed its six Rust unit tests, all 37 fixtures, and the official dev comparison. Reversing all input part-file names and running with one worker produced byte-identical Parquet to the normal eight-worker run. An argv-only three-worker run was byte-identical too. A header-only dataset produced both zero-row tables with exactly the required columns and a DATE `day`.
 
-The linear 60M memory extrapolation from the measured maximum is **12.33 GiB** (not a 60M measurement). Leave headroom for a different seed's linked-ID and output cardinalities. The requested sub-two-second target has not been reached on this laptop; correctness and the final-run three-minute ceiling have large measured margins, but a competitive practice score is not established.
+The round-one linear 60M memory extrapolation from its measured maximum was **12.33 GiB** (not a 60M measurement). Leave headroom for a different seed's linked-ID and output cardinalities. That implementation did not reach the sub-two-second target; later checkpoints below supersede its performance.
 
-## Final container measurements
+## Round-one container measurements
 
 Scorer restrictions were used: uid 1000, read-only root, no network, 64 MiB `/tmp`, eight-CPU quota, 12 GiB RAM with no extra swap, and the three input/output/scratch mounts. The rootless local cgroup does not delegate `cpuset`, so `--cpuset-cpus` is unavailable. CPU affinity was instead set **inside** the container with its existing `/usr/bin/taskset`; `/proc/self/status` confirmed `Cpus_allowed_list: 0-7`. Setting affinity only on the Docker client does not propagate through this runtime.
 
@@ -178,9 +178,58 @@ A packed-order/round-trip test covers 10,000 generated strings, prefixes, digits
 
 Native gates passed in both forced modes: 37/37 fixtures, official dev MATCH, and ten Rust unit tests. Five warm packed-path 20M runs on CPUs 0-7 measured **1.69 s best / 1.70 s median**, peak **3,288,296 KiB**. These timings exclude the independent scanner integration.
 
+Checkpoint 4 additionally passed all twelve independent crosscheck seeds in **both** modes, including 20M seed 3. Its pinned-base `shopping-rust-cp4` container passed 37/37 fixtures and dev MATCH; image size was 78,626,415 bytes. The verified source and paired executable are saved at `/tmp/rust-good-4/`.
+
 ```sh
 SHOPPING_PATH=packed $PY scripts/run_fixtures.py fixtures -- target/release/shopping-sessions
 SHOPPING_PATH=string $PY scripts/run_fixtures.py fixtures -- target/release/shopping-sessions
 SHOPPING_PATH=packed taskset -c 12-19 nice -n 10 $PY tools/crosscheck.py -- taskset -c 12-19 /tmp/rust-good-4/shopping-sessions
 SHOPPING_PATH=string taskset -c 12-19 nice -n 10 $PY tools/crosscheck.py -- taskset -c 12-19 /tmp/rust-good-4/shopping-sessions
 ```
+
+## Checkpoint 5: packed IDs plus single-pass scanning
+
+`scan.rs` fuses newline/comma/quote scanning with field extraction, dispatching at runtime to AVX2/BMI1/POPCNT or an exact portable implementation. Event and click parsing use it; small catalogs and links retain the existing parser. Fixed-layout timestamp validation uses SWAR with the scalar parser retained for other forms. ScanLab checked equivalence against the checkpoint-three parser with real files, approximately 30M generated CSV lines, and 19M timestamps before integration.
+
+Observed gates: ten Rust unit tests; 37/37 fixtures and official dev MATCH in both packed and forced-string modes; 12/12 independent crosscheck seeds through the packed path; container 37/37 and dev MATCH. Reversed input filenames with one packed worker and three forced-string workers both MATCH the normal eight-worker output. Native and container 20M outputs MATCH the independent reference (2,240,415 user rows, 28,014 campaign rows).
+
+Five paired native 20M runs, alternating immutable checkpoint-four/five executables on CPUs 0-7: checkpoint four **1.69 s best / 1.71 s median**, checkpoint five **1.43 s best / 1.43 s median**. The first unpaired scanner run was cold/noisy (2.01 s); it is not substituted into the paired comparison.
+
+| Dataset / execution | Best process wall | Median process wall | Peak process RSS |
+|---|---:|---:|---:|
+| dev, native | 0.06 s | 0.07 s | 189,484 KiB |
+| 20M seed 2, native | 1.43 s | 1.43 s | 3,312,884 KiB |
+| dev, container | 0.068 s | 0.072 s | 189,936 KiB |
+| 20M seed 2, container | 1.446 s | 1.451 s | 3,296,540 KiB |
+
+Container timings use the pinned in-container affinity and scorer flags documented above, with image `shopping-rust-cp5`. Median Podman-client wall was 0.18 s for dev and 1.55 s for 20M. The clean-built image is 78,641,776 bytes. A `--no-cache` image build took **18.30 s**, including dependency downloads through the host-injected mirror, with base images already present. The native release compile took 6.19 s with dependencies cached. Both builder and runtime base images are pinned by digest; no registry mirror is encoded in the entry.
+
+The largest native peak across the initial and paired scanner runs was 3,321,644 KiB. A conservative linear extrapolation to 60M is **9.51 GiB**, not a 60M measurement; different seed cardinalities still need headroom. No timestamp narrowing, CPU-native code generation, forced process exit, or new dependency was introduced.
+
+### Checkpoint-five phase profile
+
+Medians of five instrumented 20M runs, CPUs 0-7, eight workers. Wall values for bucket phases are overlapping envelopes, not sequential critical-path costs; busy threads are the median of per-run CPU/wall ratios. Links overlap event parsing, and click parsing overlaps dedup. Actual mmap page faults remain charged to the parsing phases.
+
+| Phase | Wall / envelope (s) | CPU work (s) | Average busy threads |
+|---|---:|---:|---:|
+| File discovery/open/mmap | 0.000435 | 0.000467 | 1.02 |
+| Links parse + union-find + flatten | 0.447385 | 0.444859 | 0.99 |
+| Product/campaign catalogs | 0.003281 | 0.003272 | 1.00 |
+| Events parse + validate | 0.514446 | 3.621892 | 7.05 |
+| Event dedup + person partition | 0.361368 | 2.842972 | 7.87 |
+| Click parse + validate + partition | 0.137366 | 1.063957 | 7.74 |
+| Bucket-vector concatenation | 0.299829 | 0.182796 | 0.64 |
+| Event ordering | 0.314795 | 1.219663 | 3.77 |
+| Click ordering | 0.290496 | 0.390659 | 1.32 |
+| Person-group discovery | 0.280860 | 0.074573 | 0.26 |
+| Fused sessions + attribution + aggregation | 0.290506 | 0.536520 | 1.84 |
+| Campaign reduction | 0.004157 | 0.011818 | 2.81 |
+| Parquet encoding + writes | 0.284402 | 0.101421 | 0.35 |
+| Parquet writes only, included above | 0.282399 | 0.027852 | 0.10 |
+| Explicit userspace destruction/unmap | 0.036519 | 0.036352 | 1.00 |
+
+[INFERENCE] Calibrated samples split the fused stage into approximately 0.043 s allocated wall / 0.079 CPU s for session boundaries; 0.168 / 0.311 for credit and assists; and 0.079 / 0.147 for daily aggregation. Their busy-thread contributions over the fused envelope are 0.27, 1.07, and 0.51 respectively. These allocations are relative work estimates, not independently measured non-overlapping phases. Default native exit occurs approximately 0.07 s after the final pipeline log; only the explicit destruction portion is separately attributed.
+
+Raw profile logs: `out-rust-cp5-bench/phase-logs/{1,2,3,4,5}.log` (generated, gitignored). Reproduce with the correctness and pinned-container commands above, changing the image to `shopping-rust-cp5`; the default path is packed with automatic exact fallback.
+
+Verified source and its paired native executable are saved at `/tmp/rust-good-5/`. The scanner module is included unchanged from ScanLab.
