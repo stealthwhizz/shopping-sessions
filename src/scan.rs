@@ -178,17 +178,59 @@ fn datetime(s: &[u8]) -> Option<i64> {
         let offset = (h * 60 + m) as i64 * 60;
         (byte(c, 0), if s[19] == b'+' { offset } else { -offset })
     };
-    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-    const DAYS: [u32; 13] = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    if hour > 23 || minute > 59 || second > 59 { return None; }
+    let days = if (TABLE_YEAR..TABLE_YEAR+TABLE_YEARS).contains(&year) && month <= 12 && day <= 31 {
+        match DAYS_SINCE_TABLE_YEAR[(((year - TABLE_YEAR) * 13 + month) * 32 + day) as usize] {
+            u16::MAX => return None,
+            days => days as i64 + TABLE_YEAR_EPOCH_DAY,
+        }
+    } else {
+        epoch_day(year, month, day)?
+    };
+    Some((days * 86400 + (hour * 3600 + minute * 60 + second) as i64 - offset) * 1000)
+}
+
+const DAYS: [u32; 13] = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+const fn leap(year: u32) -> bool { year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) }
+
+/// Days from 1970-01-01 to a valid date; `None` for an impossible one.
+fn epoch_day(year: u32, month: u32, day: u32) -> Option<i64> {
     const BEFORE: [u32; 13] = [0, 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
     if !(1..=12).contains(&month) { return None; }
-    let max_day = DAYS[month as usize] + (leap && month == 2) as u32;
-    if day < 1 || day > max_day || hour > 23 || minute > 59 || second > 59 { return None; }
+    let leap = leap(year);
+    if day < 1 || day > DAYS[month as usize] + (leap && month == 2) as u32 { return None; }
     // Days since 0000-01-01 (proleptic Gregorian, year 0 leap) minus those up to 1970-01-01.
     let doy = BEFORE[month as usize] + day - 1 + (leap && month > 2) as u32;
     let days = 365 * year + (year + 3) / 4 - (year + 99) / 100 + (year + 399) / 400 + doy;
-    Some(((days as i64 - 719_528) * 86400 + (hour * 3600 + minute * 60 + second) as i64 - offset) * 1000)
+    Some(days as i64 - 719_528)
 }
+
+/// Calendar lookup replacing leap-year and day-count arithmetic for the years real data uses:
+/// entry `((year - TABLE_YEAR) * 13 + month) * 32 + day` is days since TABLE_YEAR-01-01,
+/// or `u16::MAX` for an impossible date (month 0, day 0, February 30, ...).
+const TABLE_YEAR: u32 = 2000;
+const TABLE_YEARS: u32 = 128;
+const TABLE_YEAR_EPOCH_DAY: i64 = 10_957;
+static DAYS_SINCE_TABLE_YEAR: [u16; (TABLE_YEARS * 13 * 32) as usize] = {
+    let mut table = [u16::MAX; (TABLE_YEARS * 13 * 32) as usize];
+    let mut days = 0u32;
+    let mut y = 0;
+    while y < TABLE_YEARS {
+        let mut month = 1;
+        while month <= 12 {
+            let mut day = 1;
+            while day <= DAYS[month as usize] + (leap(TABLE_YEAR + y) && month == 2) as u32 {
+                table[((y * 13 + month) * 32 + day) as usize] = days as u16;
+                days += 1;
+                day += 1;
+            }
+            month += 1;
+        }
+        y += 1;
+    }
+    table
+};
 
 fn digits(bytes: &[u8]) -> Option<i64> {
     if bytes.is_empty() { return None; }
@@ -233,4 +275,47 @@ fn timestamp_slow(s: &[u8]) -> Option<i64> {
         (h*60+m) * 60 * if s[19] == b'+' { 1 } else { -1 }
     };
     Some((civil_days(year, month, day)*86400 + hour*3600 + minute*60 + second - offset)*1000)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn scan_matches_line_by_line_csv_across_blocks() {
+        let mut state = 3u64;
+        let mut next = |n: u64| { state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (state >> 33) % n };
+        let pieces: [&[u8]; 9] = [b"a", b"\"q\"", b"\"", b"", b"xyz", b"\"\"", b"\r", b"0123456789abcdef", b" "];
+        for round in 0..300 {
+            let mut text = Vec::new();
+            let lines = next(400);
+            for _ in 0..lines {
+                let fields = if next(4) == 0 { next(10) } else { 7 };
+                for k in 0..fields {
+                    if k > 0 { text.push(b','); }
+                    text.extend_from_slice(pieces[next(pieces.len() as u64) as usize]);
+                }
+                if next(50) == 0 { text.extend(std::iter::repeat_n(b',', next(5000) as usize)); }
+                if next(30) == 0 { text.extend(std::iter::repeat_n(b'"', next(200) as usize)); }
+                text.push(b'\n');
+            }
+            if round % 2 == 0 { text.extend_from_slice(b"t,\"u\",,,,,z"); }
+            let expected: Vec<_> = crate::input::lines(&text).map(crate::input::csv::<7>).collect();
+            let mut actual = Vec::new();
+            scan::<7>(&text, |f| actual.push(f), masks_portable);
+            assert_eq!(actual, expected, "round {round}");
+        }
+    }
+    #[test]
+    fn fast_datetime_matches_reference_on_every_calendar_cell() {
+        for year in (1995..2135).chain([0, 1970, 9999]) {
+            for month in 0..=13 {
+                for day in 0..=32 {
+                    for (time, zone) in [("00:00:00", "Z"), ("23:59:59", "Z"), ("12:34:56", "+05:30"), ("00:00:00", "-23:59"), ("24:00:00", "Z")] {
+                        let s = format!("{year:04}-{month:02}-{day:02}T{time}{zone}");
+                        assert_eq!(timestamp(s.as_bytes()), timestamp_slow(s.as_bytes()), "{s}");
+                    }
+                }
+            }
+        }
+    }
 }
