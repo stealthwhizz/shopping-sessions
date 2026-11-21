@@ -258,3 +258,19 @@ A 256-byte constant lookup table replaces per-character alphanumeric branches. C
 Before the allocator setting, five paired 20M runs improved checkpoint-six best/median **1.31/1.32 s** to **1.16/1.17 s**. With the required allocator setting, a separate quiet paired run improved checkpoint six **1.21/1.23 s** to checkpoint seven **1.05/1.06 s**, with peak **3,051,832 KiB**. Concurrent build/reference runs were substantially noisier and are not substituted into this quiet comparison.
 
 Observed gates: 14 unit tests; 37/37 and dev MATCH for compact, wide and string paths; packed crosscheck 12/12 including 20M; container 37/37 and dev MATCH. The image is **78,720,865 bytes**. The source and paired executable are saved at `/tmp/rust-good-7/`. `scan.rs` remains unchanged; its additional equivalence suites are required before any future scanner edit is retained.
+
+### Rejected direct dedup/person-scatter fusion
+
+Emitting each dedup winner directly into its person bucket removed the intermediate event vector and both repartition passes, and passed unit tests, 37 fixtures and dev MATCH. Nevertheless, all five paired 20M runs were neutral/slower: baseline best/median **1.06/1.08 s**, fused **1.08/1.11 s**. The fusion was fully removed. [INFERENCE] Mixing canonical-name lookups and 32 output write streams lost locality; fewer logical passes did not improve the measured critical path.
+
+Caching each exact event ID alongside the dedup-table row pointer also passed 14 tests, fixtures and dev MATCH, but was slower in all but one neutral pair: baseline median **1.10 s**, cached slots **1.15 s**. The doubled numeric slot width was not worth avoiding collision-time row reads, so this experiment was completely removed.
+
+## Checkpoint 8: flat canonical-identity lookup
+
+Links now use an exact open-addressing table throughout union-find and final lookup, rather than constructing the standard hash map twice. A physical-row count bounds capacity at no more than half occupancy. Roots still use union by size, path halving and the exact minimum name. Empty keys are only unused-slot markers; empty link fields remain ignored.
+
+Dedup survivors and validated clicks first retain their raw user IDs, then a separate resolve pass prefetches the lookup slot 16 rows ahead. Numeric `(ID, canonical ID)` pairs are interleaved in 16-byte slots, so one prefetched cache line supplies both. The generic exact string path uses the same algorithm. Collision/transitive-union and Unicode/fallback regression tests raise the test count to 16.
+
+Five three-way paired 20M runs (CPUs 0-7, allocator tunables exported) measured checkpoint seven **1.24 s best / 1.25 s median**, separate-key/value flat arrays **1.15/1.19 s**, and retained interleaved slots **1.14/1.14 s**, peak **3,038,184 KiB**. Absolute clocks were affected by concurrent work; only paired comparisons are used for the decision.
+
+Observed gates for the retained interleaved version: 16 tests; 37/37 fixtures and dev MATCH for compact/wide/string; packed crosscheck 12/12 including 20M; container 37/37 and dev MATCH. Image `shopping-rust-cp8` is **78,717,280 bytes**. The exact source and paired executable are saved at `/tmp/rust-good-8/`.

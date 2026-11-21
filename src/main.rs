@@ -103,12 +103,20 @@ fn parse_clicks<'a, K: Key<'a>, L: Layout>(bytes: &'a [u8], links: &Links<K>, ca
         };
         let Some(ts) = timestamp(ts).filter(|&ts| ts >= start-WEEK && ts < end) else { return };
         let Some(&campaign) = catalog.campaign_ids.get(campaign) else { return };
-        let user = links.name(user);
         // Click duplicates have identical values: repeating one changes neither the
         // winning click nor the per-campaign sliding-window counts' zero/nonzero state.
         rows.push(Click { user, id, ts: L::click(ts, origin), campaign });
     });
+    resolve(&mut rows, links, |row| &mut row.user);
     rows
+}
+
+fn resolve<'a, K: Key<'a>, T>(rows: &mut [T], links: &Links<K>, user: impl Fn(&mut T) -> &mut K) {
+    for i in 0..rows.len() {
+        if i+16 < rows.len() { links.prefetch(*user(&mut rows[i+16])); }
+        let id = user(&mut rows[i]);
+        *id = links.name(*id);
+    }
 }
 
 
@@ -157,9 +165,9 @@ fn dedup<'a, K: Key<'a>, L: Layout>(parts: Vec<Vec<RawEvent<K,L>>>, links: &Link
     }
     let mut events = Vec::with_capacity(count);
     for row in table.into_iter().flatten().filter(|r| L::valid(r.data)) {
-        let user = links.name(row.user);
-        events.push(Event { user, data: row.data });
+        events.push(Event { user: row.user, data: row.data });
     }
+    resolve(&mut events, links, |row| &mut row.user);
     events
 }
 

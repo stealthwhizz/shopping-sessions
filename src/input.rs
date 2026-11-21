@@ -156,13 +156,20 @@ pub fn window(path: &Path) -> Result<(i64,i64), Box<dyn std::error::Error>> {
     Ok((value("\"window_start\"").ok_or("invalid window_start")?, value("\"window_end\"").ok_or("invalid window_end")?))
 }
 
-pub struct Links<K> { ids: Map<K, K> }
+pub struct Links<K> { ids: Vec<(K,K)>, mask: usize, empty: K }
 impl<K> Links<K> {
     pub fn new<'a>(maps: &'a [Mmap], unsupported: &AtomicBool) -> Self where K: Key<'a> {
-        let mut ids = Map::default();
-        let mut names = Vec::<K>::new();
-        let mut parent = Vec::<usize>::new();
-        let mut size = Vec::<usize>::new();
+        let rows: usize = maps.iter().map(|map| {
+            let bytes = body(map);
+            memchr_iter(b'\n', bytes).count() + usize::from(!bytes.is_empty() && bytes.last() != Some(&b'\n'))
+        }).sum();
+        // Each physical row adds at most two IDs; keep the lookup table at most half full.
+        let capacity = (rows*4).max(1).next_power_of_two();
+        let mask = capacity-1;
+        let empty = K::parse(b"").expect("empty IDs must be representable");
+        let mut ids = vec![(empty,empty);capacity];
+        let mut parent = vec![0usize;capacity];
+        let mut size = vec![0usize;capacity];
         fn root(parent: &mut [usize], mut i: usize) -> usize {
             while parent[i] != i { parent[i] = parent[parent[i]]; i = parent[i]; }
             i
@@ -175,32 +182,92 @@ impl<K> Links<K> {
                     unsupported.store(true, Relaxed); continue;
                 };
                 let mut pair = [0;2];
-                for (slot, key) in pair.iter_mut().zip([a,b]) {
-                    *slot = *ids.entry(key).or_insert_with(|| {
-                        let i = parent.len(); parent.push(i); size.push(1); names.push(key); i
-                    });
+                for (slot, id) in pair.iter_mut().zip([a,b]) {
+                    let mut i = id.fingerprint() as usize & mask;
+                    while ids[i].0 != empty && ids[i].0 != id { i = (i+1)&mask; }
+                    if ids[i].0 == empty {
+                        ids[i] = (id,id); parent[i] = i; size[i] = 1;
+                    }
+                    *slot = i;
                 }
                 let mut a = root(&mut parent, pair[0]);
                 let mut b = root(&mut parent, pair[1]);
                 if a == b { continue; }
                 if size[a] < size[b] { std::mem::swap(&mut a, &mut b); }
-                parent[b] = a;
-                size[a] += size[b];
-                names[a] = names[a].min(names[b]);
+                parent[b] = a; size[a] += size[b];
+                ids[a].1 = ids[a].1.min(ids[b].1);
             }
         }
-        for i in 0..parent.len() { let r = root(&mut parent,i); names[i] = names[r]; }
-        let ids = ids.into_iter().map(|(id,i)| (id,names[i])).collect();
-        Self { ids }
+        for i in 0..capacity {
+            if ids[i].0 != empty { let r = root(&mut parent,i); ids[i].1 = ids[r].1; }
+        }
+        Self { ids, mask, empty }
     }
-    pub fn name(&self, id: K) -> K where K: Copy+Eq+std::hash::Hash {
-        self.ids.get(&id).copied().unwrap_or(id)
+    #[inline]
+    pub fn name<'a>(&self, id: K) -> K where K: Key<'a> {
+        let mut slot = id.fingerprint() as usize & self.mask;
+        loop {
+            let (key,name) = self.ids[slot];
+            if key == self.empty { return id; }
+            if key == id { return name; }
+            slot = (slot+1)&self.mask;
+        }
+    }
+    #[inline]
+    pub fn prefetch<'a>(&self, id: K) where K: Key<'a> {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            let slot = id.fingerprint() as usize & self.mask;
+            // The address is in the allocation; prefetch does not dereference it.
+            std::arch::x86_64::_mm_prefetch(self.ids.as_ptr().add(slot).cast(), std::arch::x86_64::_MM_HINT_T0);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn mapped(bytes: &[u8]) -> Mmap {
+        let mut map = memmap2::MmapMut::map_anon(bytes.len()).unwrap();
+        map.copy_from_slice(bytes);
+        map.make_read_only().unwrap()
+    }
+    #[test]
+    fn flat_links_keep_exact_identity_through_collisions_and_transitive_unions() {
+        #[derive(Clone,Copy,Debug,Eq,PartialEq,Ord,PartialOrd,Hash)]
+        struct Collision(u64);
+        impl Key<'_> for Collision {
+            fn parse(bytes: &[u8]) -> Option<Self> { crate::keys::pack(bytes).map(Self) }
+            fn fingerprint(self) -> u64 { 7 }
+            fn append_plain(self, bytes: &mut Vec<u8>) { self.0.append_plain(bytes); }
+        }
+        let maps = [mapped(b"left,right\nq,a\nb,q\nc,b\nq,q\n\n,x")];
+        let unsupported = AtomicBool::new(false);
+        let links = Links::<Collision>::new(&maps, &unsupported);
+        let a = Collision::parse(b"a").unwrap();
+        for id in [b"a",b"b",b"c",b"q"] {
+            let id = Collision::parse(id).unwrap();
+            links.prefetch(id);
+            assert_eq!(links.name(id), a);
+        }
+        let x = Collision::parse(b"x").unwrap();
+        assert_eq!(links.name(x), x);
+        assert!(!unsupported.load(Relaxed));
+    }
+    #[test]
+    fn flat_links_preserve_unicode_byte_order_and_packed_fallback() {
+        let maps = [mapped(b"left,right\nz,\xc3\xa9\n\xc3\xa9,A\nA,0")];
+        let unsupported = AtomicBool::new(false);
+        let _ = Links::<u64>::new(&maps, &unsupported);
+        assert!(unsupported.load(Relaxed));
+        unsupported.store(false, Relaxed);
+        let links = Links::<&[u8]>::new(&maps, &unsupported);
+        for id in [&b"z"[..], b"\xc3\xa9", b"A", b"0"] {
+            assert_eq!(links.name(id), b"0");
+        }
+        assert_eq!(links.name(b"x"), b"x");
+        assert!(!unsupported.load(Relaxed));
+    }
     #[test]
     fn csv_preserves_carriage_returns_and_spaces_and_rejects_inner_quotes() {
         assert_eq!(csv::<2>(b"\" a\",b\r"), Some([&b" a"[..], &b"b\r"[..]]));
