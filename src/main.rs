@@ -353,8 +353,35 @@ fn top_category(totals: &[(u32,i64)], names: &[&[u8]]) -> Option<u32> {
     totals.iter().max_by(|a,b| a.1.cmp(&b.1).then_with(|| names[b.0 as usize].cmp(names[a.0 as usize]))).map(|v| v.0)
 }
 
-fn person<K: Copy+Ord, L: Layout>(agg: &mut Aggregate<K>, events: &[Event<K,L>], clicks: &[Click<K,L>], categories: &[&[u8]], origin: i64) {
-    let mut active = Map::<u32,u32>::default();
+/// Campaigns with at least one click in the current session's 7-day window, as a dense set:
+/// `count[c]` clicks in the window, `list` the campaigns with a nonzero count, `pos[c]` the
+/// index of c in `list`. Adding or removing a click is O(1), and the assists loop walks only
+/// `list`. Empty between persons.
+struct Active { count: Vec<u32>, pos: Vec<u32>, list: Vec<u32> }
+impl Active {
+    fn new(campaigns: usize) -> Self { Self { count: vec![0; campaigns], pos: vec![0; campaigns], list: Vec::new() } }
+    #[inline]
+    fn add(&mut self, campaign: u32) {
+        let c = campaign as usize;
+        if self.count[c] == 0 { self.pos[c] = self.list.len() as u32; self.list.push(campaign); }
+        self.count[c] += 1;
+    }
+    #[inline]
+    fn remove(&mut self, campaign: u32) {
+        let c = campaign as usize;
+        self.count[c] -= 1;
+        if self.count[c] == 0 {
+            let last = self.list.pop().unwrap();
+            if last != campaign { let p = self.pos[c]; self.list[p as usize] = last; self.pos[last as usize] = p; }
+        }
+    }
+    fn clear(&mut self) {
+        for &c in &self.list { self.count[c as usize] = 0; }
+        self.list.clear();
+    }
+}
+
+fn person<K: Copy+Ord, L: Layout>(agg: &mut Aggregate<K>, active: &mut Active, events: &[Event<K,L>], clicks: &[Click<K,L>], categories: &[&[u8]], origin: i64) {
     let (mut left, mut right, mut first) = (0,0,0);
     let mut daily: Option<UserRow<K>> = None;
     let mut category_totals = Vec::<(u32,i64)>::new();
@@ -388,19 +415,17 @@ fn person<K: Copy+Ord, L: Layout>(agg: &mut Aggregate<K>, events: &[Event<K,L>],
         drop(phase);
         let phase = Span::sampled(Phase::AttributionSample, sampled);
         while right < clicks.len() && L::units(clicks[right].ts) <= start {
-            *active.entry(clicks[right].campaign).or_default() += 1;
+            active.add(clicks[right].campaign);
             right += 1;
         }
         while left < right && L::units(clicks[left].ts) < start-WEEK {
-            let campaign = clicks[left].campaign;
-            let count = active.get_mut(&campaign).unwrap(); *count -= 1;
-            if *count == 0 { active.remove(&campaign); }
+            active.remove(clicks[left].campaign);
             left += 1;
         }
         let campaign = if left < right { clicks[right-1].campaign } else { 0 };
         let credited = agg.campaign(campaign, day);
         credited.sessions += 1; credited.purchasing += i64::from(revenue > 0); credited.revenue += revenue;
-        for &campaign in active.keys() { agg.campaign(campaign, day).assists += 1; }
+        for &campaign in &active.list { agg.campaign(campaign, day).assists += 1; }
         drop(phase);
         first = last;
     }
@@ -408,6 +433,7 @@ fn person<K: Copy+Ord, L: Layout>(agg: &mut Aggregate<K>, events: &[Event<K,L>],
     if let Some(mut row) = daily {
         row.category = top_category(&category_totals, categories); agg.users.push(row);
     }
+    active.clear();
 }
 
 fn output_users<'a, K: Key<'a>>(path: &Path, part: usize, rows: &[UserRow<K>], catalog: &Catalog<'_>) -> std::io::Result<()> {
@@ -481,6 +507,7 @@ fn pipeline<'a, K: Key<'a>, L: Layout>(link_maps: &'a [Mmap], event_maps: &'a [M
     let campaign_parts = (0..rayon::current_num_threads()).into_par_iter().map(|_| {
         let mut agg = Aggregate::new(catalog.campaigns.len(), first_day, days);
         let mut grouper = Grouper::default();
+        let mut active = Active::new(catalog.campaigns.len());
         while let Some(&part) = order.get(next.fetch_add(1, Relaxed)) {
             let (events, clicks) = tasks[part].lock().unwrap().take().unwrap();
             let grouped = group(&mut grouper, events, clicks);
@@ -488,7 +515,7 @@ fn pipeline<'a, K: Key<'a>, L: Layout>(link_maps: &'a [Mmap], event_maps: &'a [M
             agg.users.clear();
             for p in 0..grouped.event_starts.len()-1 {
                 let (events, clicks) = (grouped.event_starts[p] as usize..grouped.event_starts[p+1] as usize, grouped.click_starts[p] as usize..grouped.click_starts[p+1] as usize);
-                person(&mut agg, &grouped.events[events], &grouped.clicks[clicks], &catalog.categories, origin);
+                person(&mut agg, &mut active, &grouped.events[events], &grouped.clicks[clicks], &catalog.categories, origin);
             }
             drop(phase);
             output_users(out, part, &agg.users, catalog)?;
