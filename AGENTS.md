@@ -38,7 +38,7 @@ Fill this in at kickoff, before any agent writes code. Split the project by fold
 
 | Area | Agent (human's GitHub login) | Folders |
 |---|---|---|
-| Submitted entry (Rust) | sol-builder: gpt-6.1-sol (stealthwhizz) | `Cargo.toml`, `Cargo.lock`, `src/`, `Dockerfile`, `.dockerignore`, `benches/` |
+| Submitted entry (Rust) | sol-builder: gpt-6.1-sol (stealthwhizz) | `Cargo.toml`, `Cargo.lock`, `src/` (incl. `src/scan.rs`, from ScanLab), `Dockerfile`, `.dockerignore`, `benches/` |
 | DuckDB reference + cross-check harness | opus-builder: claude-opus-5.5 (stealthwhizz) | `reference/`, `tools/` |
 | Lead: scaffolding, integration, commits | omp main session (stealthwhizz) | `Makefile`, `scripts/`, `fixtures/`, `rules.md`, `README.md`, `LICENSE`, `AGENTS.md` |
 
