@@ -18,6 +18,7 @@ The measurements through the first phase breakdown describe the original round-o
 
 ```sh
 PY=../event/shopping/.venv/bin/python
+export GLIBC_TUNABLES=glibc.malloc.hugetlb=1:glibc.malloc.top_pad=268435456
 cargo build --release
 cargo test
 $PY scripts/run_fixtures.py fixtures -- target/release/shopping-sessions
@@ -243,3 +244,17 @@ Both layouts instantiate the same rule-processing functions. Packed raw events s
 Observed: 13 unit tests; 37/37 fixtures and dev MATCH through compact, forced-wide, and forced-string paths; packed crosscheck 12/12 including 20M; container 37/37 and dev MATCH. Image `shopping-rust-cp6` is 78,718,573 bytes. Paired CPU0-7 20M runs gave checkpoint-five best/median **1.41/1.41 s**, compact records **1.32/1.33 s**, with all five pairs faster. Compact peak RSS was **2,997,120 KiB** (linear 60M extrapolation approximately **8.58 GiB**, not measured).
 
 The verified source and paired native executable are saved at `/tmp/rust-good-6/`.
+
+### Rejected ordering experiments after checkpoint six
+
+An in-place 256-way MSD radix sort (exact packed user keys, timestamp sort within one-user groups) passed the property test, fixtures and dev comparison, but paired 20M median was 1.37 s versus scalar sorting's 1.36 s. Branch-light `u128` comparison keys were also neutral/slower (1.36 versus 1.35 s). Both implementations, their unused key hooks, and experiment-only code were completely removed.
+
+The runtime now includes RunLevel's measured allocator setting, `GLIBC_TUNABLES=glibc.malloc.hugetlb=1:glibc.malloc.top_pad=268435456`. Native timing commands must export the same value; the container receives it from the Dockerfile. Historical timings above predate this setting.
+
+## Checkpoint 7: branchless exact ID packing
+
+A 256-byte constant lookup table replaces per-character alphanumeric branches. Codes are accumulated six bits at a time and left-aligned once; a combined invalid flag preserves exact fallback for every unsupported byte. An exhaustive 256-single-byte test supplements the existing 10,000-string order/round-trip checks.
+
+Before the allocator setting, five paired 20M runs improved checkpoint-six best/median **1.31/1.32 s** to **1.16/1.17 s**. With the required allocator setting, a separate quiet paired run improved checkpoint six **1.21/1.23 s** to checkpoint seven **1.05/1.06 s**, with peak **3,051,832 KiB**. Concurrent build/reference runs were substantially noisier and are not substituted into this quiet comparison.
+
+Observed gates: 14 unit tests; 37/37 and dev MATCH for compact, wide and string paths; packed crosscheck 12/12 including 20M; container 37/37 and dev MATCH. The image is **78,720,865 bytes**. The source and paired executable are saved at `/tmp/rust-good-7/`. `scan.rs` remains unchanged; its additional equivalence suites are required before any future scanner edit is retained.

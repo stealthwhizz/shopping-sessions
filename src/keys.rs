@@ -1,20 +1,29 @@
 use std::hash::{Hash, Hasher};
 
 const ALPHABET: &[u8;63] = b"\00123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+const CODES: [u8;256] = {
+    let mut codes = [0;256];
+    let mut i = 0;
+    while i < 10 { codes[b'0' as usize+i] = i as u8+1; i += 1; }
+    i = 0;
+    while i < 26 {
+        codes[b'A' as usize+i] = i as u8+11;
+        codes[b'a' as usize+i] = i as u8+37;
+        i += 1;
+    }
+    codes
+};
 
 pub fn pack(bytes: &[u8]) -> Option<u64> {
     if bytes.len() > 10 { return None; }
-    let mut key = 0;
-    for (i,&byte) in bytes.iter().enumerate() {
-        let code = match byte {
-            b'0'..=b'9' => byte-b'0'+1,
-            b'A'..=b'Z' => byte-b'A'+11,
-            b'a'..=b'z' => byte-b'a'+37,
-            _ => return None,
-        };
-        key |= (code as u64) << (58-6*i);
+    let mut key = 0u64;
+    let mut invalid = false;
+    for &byte in bytes {
+        let code = CODES[byte as usize];
+        invalid |= code == 0;
+        key = (key << 6) | u64::from(code);
     }
-    Some(key)
+    (!invalid).then_some(key << ((64-6*bytes.len()) & 63))
 }
 
 pub fn unpack(mut key: u64, bytes: &mut [u8;10]) -> usize {
@@ -57,6 +66,18 @@ impl<'a> Key<'a> for &'a [u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn every_byte_uses_the_exact_ascii_code_or_fallback() {
+        for byte in 0..=255u8 {
+            let code = match byte {
+                b'0'..=b'9' => Some(byte-b'0'+1),
+                b'A'..=b'Z' => Some(byte-b'A'+11),
+                b'a'..=b'z' => Some(byte-b'a'+37),
+                _ => None,
+            };
+            assert_eq!(pack(&[byte]), code.map(|code| u64::from(code)<<58));
+        }
+    }
     #[test]
     fn packed_order_matches_byte_order_including_prefixes_and_case() {
         assert_eq!(pack(b"u"), Some(57u64<<58));
