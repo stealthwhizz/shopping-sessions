@@ -22,7 +22,10 @@ const DEDUP_BUCKETS: usize = 1 << DEDUP_BITS;
 const _: () = assert!(DEDUP_BITS <= 16 && DEDUP_BUCKETS % DEDUP_TASKS == 0);
 /// Dedup tasks, each taking DEDUP_BUCKETS/DEDUP_TASKS consecutive buckets.
 const DEDUP_TASKS: usize = 128;
-const USER_BUCKETS: usize = 32;
+/// Person buckets: 128 keeps a bucket's events (~2.4 MB at 20M) near L2 for the sorts and the
+/// largest bucket at ~2% of rows (mostly its whale person), for even scheduling.
+const USER_BITS: u32 = 7;
+const USER_BUCKETS: usize = 1 << USER_BITS;
 
 struct Catalog<'a> {
     products: Map<&'a [u8], u32>,
@@ -165,9 +168,9 @@ fn flatten<T>(parts: Vec<Vec<T>>) -> Vec<T> {
 
 fn partition<T>(rows: Vec<T>, key: impl Fn(&T) -> u64) -> Vec<Vec<T>> {
     let mut counts = [0; USER_BUCKETS];
-    for row in &rows { counts[(key(row) >> 59) as usize] += 1; }
+    for row in &rows { counts[(key(row) >> (64-USER_BITS)) as usize] += 1; }
     let mut buckets: Vec<Vec<T>> = counts.into_iter().map(Vec::with_capacity).collect();
-    for row in rows { buckets[(key(&row) >> 59) as usize].push(row); }
+    for row in rows { buckets[(key(&row) >> (64-USER_BITS)) as usize].push(row); }
     buckets
 }
 
