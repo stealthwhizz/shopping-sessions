@@ -397,28 +397,40 @@ fn pipeline<'a, K: Key<'a>, L: Layout>(link_maps: &'a [Mmap], event_maps: &'a [M
     }).collect(), USER_BUCKETS);
     drop(phase);
     if unsupported.load(Relaxed) { return Ok(false); }
-    let campaign_parts: Vec<_> = events.into_par_iter().zip(clicks).enumerate().map(|(part, (events, clicks))| {
-        let phase = Span::worker(Phase::BucketCopy);
-        let mut events = flatten(events);
-        let mut clicks = flatten(clicks);
-        drop(phase);
-        let phase = Span::worker(Phase::EventSort);
-        sort_events(&mut events);
-        drop(phase);
-        let phase = Span::worker(Phase::ClickSort);
-        // Within equal timestamps the smallest click ID is last, hence right-1 wins.
-        clicks.sort_unstable_by(|a,b| a.user.cmp(&b.user).then(a.ts.cmp(&b.ts)).then_with(|| b.id.cmp(&a.id)));
-        drop(phase);
-        let phase = Span::worker(Phase::Grouping);
-        let groups = work(&events, &clicks);
-        drop(phase);
+    // Buckets run largest first (the ones holding whale persons are up to 1.4x the mean), pulled
+    // from a shared counter by one worker per thread, so the stage ends on small buckets. Each
+    // worker sums campaign totals in its own array instead of one per bucket.
+    let mut order: Vec<usize> = (0..events.len()).collect();
+    let size = |b: usize| events[b].iter().map(Vec::len).sum::<usize>() + clicks[b].iter().map(Vec::len).sum::<usize>();
+    order.sort_by_cached_key(|&b| std::cmp::Reverse(size(b)));
+    let tasks: Vec<_> = events.into_iter().zip(clicks).map(|task| std::sync::Mutex::new(Some(task))).collect();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let campaign_parts = (0..rayon::current_num_threads()).into_par_iter().map(|_| {
         let mut agg = Aggregate::new(catalog.campaigns.len(), first_day, days);
-        let phase = Span::worker(Phase::PersonFused);
-        for group in groups {
-            person(&mut agg, &events[group.events], &clicks[group.clicks], &catalog.categories, origin);
+        while let Some(&part) = order.get(next.fetch_add(1, Relaxed)) {
+            let (events, clicks) = tasks[part].lock().unwrap().take().unwrap();
+            let phase = Span::worker(Phase::BucketCopy);
+            let mut events = flatten(events);
+            let mut clicks = flatten(clicks);
+            drop(phase);
+            let phase = Span::worker(Phase::EventSort);
+            sort_events(&mut events);
+            drop(phase);
+            let phase = Span::worker(Phase::ClickSort);
+            // Within equal timestamps the smallest click ID is last, hence right-1 wins.
+            clicks.sort_unstable_by(|a,b| a.user.cmp(&b.user).then(a.ts.cmp(&b.ts)).then_with(|| b.id.cmp(&a.id)));
+            drop(phase);
+            let phase = Span::worker(Phase::Grouping);
+            let groups = work(&events, &clicks);
+            drop(phase);
+            let phase = Span::worker(Phase::PersonFused);
+            agg.users.clear();
+            for group in groups {
+                person(&mut agg, &events[group.events], &clicks[group.clicks], &catalog.categories, origin);
+            }
+            drop(phase);
+            output_users(out, part, &agg.users, catalog)?;
         }
-        drop(phase);
-        output_users(out, part, &agg.users, catalog)?;
         Ok(agg.campaigns)
     }).collect::<std::io::Result<Vec<_>>>()?;
     let campaign_totals = campaign_parts.into_par_iter().reduce_with(|mut a, b| {
