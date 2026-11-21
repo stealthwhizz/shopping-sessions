@@ -1,6 +1,8 @@
 use memchr::{memchr, memchr_iter};
 use memmap2::{Mmap, MmapOptions};
 use std::{collections::HashMap, fs::{self, File}, hash::{BuildHasherDefault, Hasher}, io, path::Path};
+use crate::keys::Key;
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
 pub const DAY: i64 = 86_400_000;
 pub const WEEK: i64 = 7 * DAY;
@@ -9,7 +11,13 @@ pub type Map<K, V> = HashMap<K, V, BuildHasherDefault<FastHasher>>;
 #[derive(Default)]
 pub struct FastHasher(u64);
 impl Hasher for FastHasher {
-    fn finish(&self) -> u64 { self.0 }
+    fn finish(&self) -> u64 {
+        // Packed IDs are left-aligned; multiplicative hashing alone preserves zero low bits.
+        let mut value = self.0;
+        value = (value ^ (value >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
+        value ^ (value >> 31)
+    }
     fn write(&mut self, bytes: &[u8]) { self.0 = hash(bytes).wrapping_add(self.0.rotate_left(17)); }
     fn write_u64(&mut self, value: u64) { self.0 = (self.0.rotate_left(5) ^ value).wrapping_mul(0x517cc1b727220a95); }
     fn write_usize(&mut self, value: usize) { self.write_u64(value as u64); }
@@ -148,11 +156,11 @@ pub fn window(path: &Path) -> Result<(i64,i64), Box<dyn std::error::Error>> {
     Ok((value("\"window_start\"").ok_or("invalid window_start")?, value("\"window_end\"").ok_or("invalid window_end")?))
 }
 
-pub struct Links<'a> { ids: Map<&'a [u8], usize>, names: Vec<&'a [u8]> }
-impl<'a> Links<'a> {
-    pub fn new(maps: &'a [Mmap]) -> Self {
+pub struct Links<K> { ids: Map<K, K> }
+impl<K> Links<K> {
+    pub fn new<'a>(maps: &'a [Mmap], unsupported: &AtomicBool) -> Self where K: Key<'a> {
         let mut ids = Map::default();
-        let mut names = Vec::<&[u8]>::new();
+        let mut names = Vec::<K>::new();
         let mut parent = Vec::<usize>::new();
         let mut size = Vec::<usize>::new();
         fn root(parent: &mut [usize], mut i: usize) -> usize {
@@ -163,6 +171,9 @@ impl<'a> Links<'a> {
             for line in lines(body(map)) {
                 let Some([a,b]) = csv::<2>(line) else { continue };
                 if a.is_empty() || b.is_empty() { continue; }
+                let (Some(a),Some(b)) = (K::parse(a),K::parse(b)) else {
+                    unsupported.store(true, Relaxed); continue;
+                };
                 let mut pair = [0;2];
                 for (slot, key) in pair.iter_mut().zip([a,b]) {
                     *slot = *ids.entry(key).or_insert_with(|| {
@@ -179,10 +190,11 @@ impl<'a> Links<'a> {
             }
         }
         for i in 0..parent.len() { let r = root(&mut parent,i); names[i] = names[r]; }
-        Self { ids, names }
+        let ids = ids.into_iter().map(|(id,i)| (id,names[i])).collect();
+        Self { ids }
     }
-    pub fn name(&self, id: &'a [u8]) -> &'a [u8] {
-        self.ids.get(id).map_or(id, |&i| self.names[i])
+    pub fn name(&self, id: K) -> K where K: Copy+Eq+std::hash::Hash {
+        self.ids.get(&id).copied().unwrap_or(id)
     }
 }
 

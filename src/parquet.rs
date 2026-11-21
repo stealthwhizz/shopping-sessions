@@ -41,6 +41,9 @@ pub struct Column {
     data: Vec<u8>,
 }
 impl Column {
+    pub fn utf8_plain(name: &'static str, data: Vec<u8>) -> Self {
+        Self { name, physical: 6, converted: Some(0), optional: false, data }
+    }
     pub fn integer(name: &'static str, values: impl Iterator<Item=i64> + Clone) -> Self {
         let narrow = values.clone().all(|value| i32::try_from(value).is_ok());
         let mut data = Vec::with_capacity(values.size_hint().0 * if narrow { 4 } else { 8 });

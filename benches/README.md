@@ -1,8 +1,8 @@
 # Rust entry
 
-`target/release/shopping-sessions` reads `DATA_DIR` / `OUTPUT_DIR`, or its two positional arguments. `NCPU` selects the Rayon worker count. It needs no scratch files and writes only the two output folders.
+`target/release/shopping-sessions` reads `DATA_DIR` / `OUTPUT_DIR`, or its two positional arguments. `NCPU` selects the Rayon worker count. `SHOPPING_PATH=packed` (default) attempts exact order-preserving numeric IDs and automatically retries with exact byte strings if any parsed ID is unsupported; `SHOPPING_PATH=string` forces the byte-string path. No output is written before numeric eligibility is known. The binary needs no scratch files and writes only the two output folders.
 
-The implementation follows `rules.md`: links use union-find with minimum-byte names; mmap-backed CSV fields are borrowed, not allocated per row; events are hash-partitioned by event ID and deduplicated before invalid retained copies are discarded; valid events and clicks are partitioned by canonical person. Per-person timestamp ordering drives sessions, attribution, and a sliding seven-day campaign-count window. Hash collisions are checked against the actual bytes, including the numeric-sort fast path. Identical click copies need not be materialized as a separate dedup table: repeating an identical click cannot change the winning click or whether its campaign's count is zero in the attribution window.
+The implementation follows `rules.md`: links use union-find with minimum-byte names; events are hash-partitioned by event ID and deduplicated before invalid retained copies are discarded; valid events and clicks are partitioned by canonical person. IDs of up to ten ASCII alphanumeric characters use six-bit codes in ASCII order, zero-padded and left-aligned in a `u64`; all other IDs retain the exact byte-string path. Hashes assign buckets only: equality, canonical names, user ordering, and click-ID ties use exact keys, never hash-only identity. Per-person timestamp ordering drives sessions, attribution, and a sliding seven-day campaign-count window. Identical click copies need not be materialized as a separate dedup table: repeating an identical click cannot change the winning click or whether its campaign's count is zero in the attribution window.
 
 Outputs are deterministic scalar Parquet v1 with PLAIN/uncompressed pages, UTF-8 string annotations, DATE days, RLE definition levels for nullable categories, and losslessly selected INT32/INT64 columns. User rows are written by each of 32 fixed person partitions as it finishes; no global output sort or user-row merge is needed. Campaign totals use dense campaign-by-day arrays. This deliberately narrow writer avoids Arrow, Thrift, compression libraries, and their startup/build costs. It rejects a data page over 2 GiB rather than emitting invalid Parquet.
 
@@ -167,3 +167,20 @@ The retained changes are dense campaign/day counters, partition-local unsorted u
 The exact source/binary for the overlapped version is saved at `/tmp/rust-good-2/`; its copied binary passed 37/37 fixtures, official dev MATCH, and 12/12 crosscheck seeds including the 20M seed. Its binary SHA-256 is `347b177abb7732c3039026d35c9528336aedf4ef53cccc086181a2bcd8aa5e23`. The subsequent clean checkpoint adds only the malformed-ingest regression fix and is saved separately before further experiments.
 
 The inline-ID experiment was intentionally removed rather than hidden behind an unused option. Prefix-scatter and packed-u64 paths have not been introduced at this checkpoint. New experiments must start from a saved `/tmp/rust-good-N/` source plus paired binary, so a successful measured state can always be submitted independently of ongoing edits.
+
+## Round-three packed identity path
+
+Both key representations instantiate one pipeline, rather than maintaining two implementations of the rules. Packed IDs map digits to 1–10, uppercase letters to 11–36, and lowercase letters to 37–62. Zero padding preserves prefix order; unsigned integer comparison is therefore byte-wise order. Unsupported event, click, user or link IDs set a shared flag before any output, and the entire exact byte-string instantiation is used instead. Product and campaign catalog IDs retain their original exact lookup behavior.
+
+The links table is flattened to key-to-canonical-key after union-find. Packed records contain only integer IDs after parsing, and names are unpacked only while encoding output. Raw events are 40 bytes, surviving events 24 bytes, and clicks 32 bytes, versus 64/40/56 bytes in the original entry. Timestamps remain `i64`; no window-length assumption or timestamp narrowing was introduced.
+
+A packed-order/round-trip test covers 10,000 generated strings, prefixes, digits and case; malformed/long/Unicode IDs exercise fallback. Another regression test catches zero low hash bits from left-aligned keys. Multiplicative hashing without final avalanche caused severe clustering (~9.5 s); the finalizer now mixes high bits into every table-index bit.
+
+Native gates passed in both forced modes: 37/37 fixtures, official dev MATCH, and ten Rust unit tests. Five warm packed-path 20M runs on CPUs 0-7 measured **1.69 s best / 1.70 s median**, peak **3,288,296 KiB**. These timings exclude the independent scanner integration.
+
+```sh
+SHOPPING_PATH=packed $PY scripts/run_fixtures.py fixtures -- target/release/shopping-sessions
+SHOPPING_PATH=string $PY scripts/run_fixtures.py fixtures -- target/release/shopping-sessions
+SHOPPING_PATH=packed taskset -c 12-19 nice -n 10 $PY tools/crosscheck.py -- taskset -c 12-19 /tmp/rust-good-4/shopping-sessions
+SHOPPING_PATH=string taskset -c 12-19 nice -n 10 $PY tools/crosscheck.py -- taskset -c 12-19 /tmp/rust-good-4/shopping-sessions
+```
